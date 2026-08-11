@@ -1287,19 +1287,37 @@ local function CreateHeader()
     clear.tex:SetPoint("CENTER", 0, 1)
     clear.tex:SetTextColor(0.8, 0.8, 0.8)
     clear:Hide()
-    clear:SetScript("OnClick", function() search:SetText(""); search:ClearFocus(); C_Container.SetItemSearch("") end)
+    -- Debounce timer: cancellable reference so rapid keystrokes collapse into one refresh
+    local _searchDebounceTimer = nil
+
+    -- CommitSearch: apply a query immediately, cancelling any pending debounce.
+    -- Used by clear-button and ESC so those feel instant.
+    local function CommitSearch(text)
+        if _searchDebounceTimer then _searchDebounceTimer:Cancel(); _searchDebounceTimer = nil end
+        if EUI_FilterEngine then EUI_FilterEngine:SetQuery(text) end
+        C_Container.SetItemSearch(text)
+        if EUI_Bags:IsVisible() then EUI_Bags:RefreshInventory() end
+    end
+
+    clear:SetScript("OnClick", function() search:SetText(""); search:ClearFocus(); CommitSearch("") end)
 
     search:SetScript("OnEscapePressed", function(self)
         self:SetText("")
         self:ClearFocus()
-        C_Container.SetItemSearch("")
+        CommitSearch("")
     end)
     search:SetScript("OnTextChanged", function(self)
         local text = self:GetText()
         placeholder:SetShown(text == "")
         clear:SetShown(text ~= "")
-        C_Container.SetItemSearch(text)
-        if EUI_Bags:IsVisible() then EUI_Bags:RefreshInventory() end
+        -- Debounce: collapse rapid keystrokes into one refresh after a short delay
+        if _searchDebounceTimer then _searchDebounceTimer:Cancel(); _searchDebounceTimer = nil end
+        local delayMs = BP().bagSearchDebounce
+        if type(delayMs) ~= "number" or delayMs <= 0 then delayMs = 100 end
+        _searchDebounceTimer = C_Timer.NewTimer(delayMs / 1000, function()
+            _searchDebounceTimer = nil
+            CommitSearch(text)
+        end)
     end)
 
     -- Close button
@@ -5043,7 +5061,15 @@ function EUI_Bags:RefreshInventory()
         elseif filterSet then
             show = data.categoryIndex and filterSet[data.categoryIndex]
         end
-        if show and data.info and data.info.isFiltered then show = false end
+        if show then
+            -- Use FilterEngine (lua-level matching + token support) when a query is
+            -- active; fall back to Blizzard's isFiltered flag when no query is set.
+            if EUI_FilterEngine and EUI_FilterEngine:IsActive() then
+                show = EUI_FilterEngine:Matches(data)
+            elseif data.info and data.info.isFiltered then
+                show = false
+            end
+        end
         if show then displayItems[#displayItems + 1] = data end
     end
 
@@ -6097,6 +6123,36 @@ function EUI_Bags:RefreshInventory()
     for i = slotIdx + 1, #itemSlots do
         local btn = itemSlots[i]
         if btn then btn:GetParent():Hide() end
+    end
+
+    -- Empty state: when a filter is active but no items matched, show a label
+    -- instead of an empty grid.  Only for category/All Items views; OneBag and
+    -- MultiBag keep dimmed slots visible, so no label is needed there.
+    if child then
+        if not EUI_Bags._emptyStateLabel then
+            local el = child:CreateFontString(nil, "OVERLAY")
+            SetBagFont(el, 12)
+            el:SetTextColor(0.5, 0.5, 0.5)
+            el:SetJustifyH("CENTER")
+            EUI_Bags._emptyStateLabel = el
+        end
+        do
+            local el = EUI_Bags._emptyStateLabel
+            local noResults = EUI_FilterEngine and EUI_FilterEngine:IsActive()
+                and selectedCategoryIndex ~= -1
+                and selectedCategoryIndex ~= -2
+                and #displayItems == 0
+            if noResults then
+                el:SetParent(child)
+                el:ClearAllPoints()
+                el:SetPoint("TOP", child, "TOP", 0, -40)
+                el:SetWidth(gridW)
+                el:SetText(EllesmereUI.L("No items found"))
+                el:Show()
+            else
+                el:Hide()
+            end
+        end
     end
 
     -- Set scroll child height to content height

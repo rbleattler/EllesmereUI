@@ -44,6 +44,8 @@ local BAGS_DEFAULTS = {
         bagDesaturateJunkItems = false,
         bagDisplayBindType    = false,
         bagBindTypeFontSize   = 11,
+        -- Search / filter settings
+        bagSearchDebounce     = 100,     -- milliseconds to wait before applying search query
     },
 }
 local db = EllesmereUI.Lite.NewDB("EllesmereUIBagsDB", BAGS_DEFAULTS)
@@ -809,6 +811,23 @@ initFrame:SetScript("OnEvent", function(self)
                   setValue=function(v)
                       db.profile.bagDesaturateJunkItems = v
                       if _G.EUI_Bags and _G.EUI_Bags.RefreshInventory then _G.EUI_Bags:RefreshInventory() end
+                  end },
+                { type="label", text="" }
+            ); y = y - h
+
+            ---------------------------------------------------------------------------
+            --  SEARCH
+            ---------------------------------------------------------------------------
+            _, h = W:SectionHeader(parent, "SEARCH", y); y = y - h
+
+            -- Search debounce delay
+            _, h = W:DualRow(parent, y,
+                { type="slider", text="Search Debounce (ms)",
+                  min=0, max=500, step=25,
+                  tooltip="How long to wait (in milliseconds) after you stop typing before filtering is applied. Lower = more responsive; higher = fewer refreshes while typing rapidly. Default: 100ms.",
+                  getValue=function() return db.profile.bagSearchDebounce or 100 end,
+                  setValue=function(v)
+                      db.profile.bagSearchDebounce = v
                   end },
                 { type="label", text="" }
             ); y = y - h

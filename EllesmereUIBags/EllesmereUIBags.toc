@@ -12,6 +12,11 @@
 # Options
 EUI_Bags_Options.lua
 
+# Pipeline modules (loaded before core so core can reference them at file scope)
+EllesmereUIBags_FilterEngine.lua
+EllesmereUIBags_CategoryEngine.lua
+EllesmereUIBags_SortEngine.lua
+
 # Core
 EllesmereUIBags_Categories.lua
 EllesmereUIBags.lua
