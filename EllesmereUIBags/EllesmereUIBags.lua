@@ -2309,6 +2309,7 @@ local function RenderButton(btn, data, _, col, row, startX, currentY, _, interac
     btn:Show()
 
     btn:SetID(data.slot or 0)
+    btn.bag = data.bag or 0   -- ContainerFrameItemButtonMixin:GetBagID() reads self.bag
     parent:SetID(data.bag or 0)
 
     -- Always clear overlays upfront (pooled buttons carry stale state from prior items)
@@ -2366,7 +2367,7 @@ local function RenderButton(btn, data, _, col, row, startX, currentY, _, interac
         local isJunk = BP().bagDesaturateJunkItems and quality == 0
         SetItemButtonDesaturated(btn, data.info.isLocked or isJunk)
 
-        local filtered = data.info.isFiltered
+        local filtered = not (EUI_FilterEngine and EUI_FilterEngine:IsActive()) and data.info.isFiltered
         btn:SetAlpha(filtered and 0.2 or 1)
         if btn._textOverlay then btn._textOverlay:SetAlpha(filtered and 0.2 or 1) end
 
@@ -5447,6 +5448,58 @@ function EUI_Bags:RefreshInventory()
             curY = curY - (blockRows * (SLOT_SIZE + SPACING))
         end
 
+        -- Renders set-gear items grouped by equipment set ID (plus an "Other" bucket
+        -- for set-gear-category items that are not in any named set).  Used both by
+        -- the standalone "Item Set Gear" category path and the group render path.
+        local function RenderSetGearSubGroups(setGearItems)
+            local setOrder = {}
+            local setItems = {}
+            local otherItems = {}
+            for _, data in ipairs(setGearItems) do
+                local sid = data._setGearSetID
+                if sid then
+                    if not setItems[sid] then
+                        setItems[sid] = {}
+                        setOrder[#setOrder + 1] = sid
+                    end
+                    setItems[sid][#setItems[sid] + 1] = data
+                else
+                    otherItems[#otherItems + 1] = data
+                end
+            end
+            if #otherItems > 0 then
+                setOrder[#setOrder + 1] = false  -- sentinel for "Other" bucket
+            end
+            for _, sid in ipairs(setOrder) do
+                local subItems = sid and setItems[sid] or otherItems
+                if #subItems > 0 then
+                    setGearSubIdx = setGearSubIdx + 1
+                    local sh = GetOrCreateSetGearSubHeader(setGearSubIdx)
+                    sh:SetParent(child)
+                    sh:ClearAllPoints()
+                    sh:SetPoint("TOPLEFT", child, "TOPLEFT", startX + 4, curY)
+                    sh:SetWidth(gridW - 8)
+                    if sid then
+                        local setName, setIcon = C_EquipmentSet.GetEquipmentSetInfo(sid)
+                        sh._label:SetText((setName or "?") .. " (" .. #subItems .. ")")
+                        if setIcon and setIcon ~= 0 then
+                            sh._icon:SetTexture(setIcon)
+                            sh._icon:Show()
+                        else
+                            sh._icon:Hide()
+                        end
+                    else
+                        sh._label:SetText("Other (" .. #subItems .. ")")
+                        sh._icon:Hide()
+                    end
+                    sh:Show()
+                    curY = curY - 18
+                    RenderItemBlock(subItems)
+                    curY = curY - 4
+                end
+            end
+        end
+
         local function RenderSection(sectionName, sectionItems, isUserCreated, showPinAdd, alwaysShow, assignCatIdx, nestByExpansion)
             local itemCount = #sectionItems
             if itemCount == 0 and not isUserCreated and not showPinAdd and not alwaysShow then return end
@@ -5677,18 +5730,62 @@ function EUI_Bags:RefreshInventory()
                     renderedGroups[cat.groupName] = true
                     if not hiddenSet[cat.groupName] then
                         local members = EUI_CategoryManager:GetGroupMembers(cat.groupName)
-                        local merged = {}
+
+                        -- Detect a set-gear member so we can sub-group by equipment set
+                        local setGearMemberIdx = nil
                         for _, mi in ipairs(members) do
-                            if itemsByCat[mi] then
-                                for _, data in ipairs(itemsByCat[mi]) do
-                                    merged[#merged + 1] = data
-                                end
+                            if cats[mi] and cats[mi].isSetGear then
+                                setGearMemberIdx = mi
+                                break
                             end
                         end
-                        if #merged > 0 then
-                            ApplySavedOrder(cat.groupName, merged)
+
+                        if setGearMemberIdx then
+                            -- Group has a set-gear member: render set-gear sub-groups then
+                            -- any remaining member items flat in the same group header.
+                            local setGearItems = itemsByCat[setGearMemberIdx] or {}
+                            local otherMerged = {}
+                            for _, mi in ipairs(members) do
+                                if mi ~= setGearMemberIdx and itemsByCat[mi] then
+                                    for _, data in ipairs(itemsByCat[mi]) do
+                                        otherMerged[#otherMerged + 1] = data
+                                    end
+                                end
+                            end
+                            local totalCount = #setGearItems + #otherMerged
+                            if totalCount > 0 then
+                                headerIdx = headerIdx + 1
+                                local hdr = GetOrCreateCatHeader(headerIdx)
+                                hdr:SetParent(child)
+                                hdr:ClearAllPoints()
+                                hdr:SetPoint("TOPLEFT", child, "TOPLEFT", startX, curY)
+                                hdr:SetWidth(gridW)
+                                hdr._label:SetText(cat.groupName .. " (" .. totalCount .. ")")
+                                hdr._hint:SetText("")
+                                hdr:Show()
+                                curY = curY - 22
+                                if #setGearItems > 0 then
+                                    RenderSetGearSubGroups(setGearItems)
+                                end
+                                if #otherMerged > 0 then
+                                    RenderItemBlock(otherMerged)
+                                end
+                                curY = curY - 2
+                            end
+                        else
+                            local merged = {}
+                            for _, mi in ipairs(members) do
+                                if itemsByCat[mi] then
+                                    for _, data in ipairs(itemsByCat[mi]) do
+                                        merged[#merged + 1] = data
+                                    end
+                                end
+                            end
+                            if #merged > 0 then
+                                ApplySavedOrder(cat.groupName, merged)
+                            end
+                            RenderSection(cat.groupName, merged, false, nil, nil, members[1], true)
                         end
-                        RenderSection(cat.groupName, merged, false, nil, nil, members[1], true)
                     end
                 end
             else
@@ -5707,56 +5804,7 @@ function EUI_Bags:RefreshInventory()
                         hdr._hint:SetText("")
                         hdr:Show()
                         curY = curY - 22
-
-                        -- Group by _setGearSetID; items without a setID land in an "Other" bucket
-                        local setOrder = {}      -- ordered list of setIDs (first-seen order)
-                        local setItems = {}      -- setID -> { items }
-                        local otherItems = {}
-                        for _, data in ipairs(catItems) do
-                            local sid = data._setGearSetID
-                            if sid then
-                                if not setItems[sid] then
-                                    setItems[sid] = {}
-                                    setOrder[#setOrder + 1] = sid
-                                end
-                                setItems[sid][#setItems[sid] + 1] = data
-                            else
-                                otherItems[#otherItems + 1] = data
-                            end
-                        end
-                        if #otherItems > 0 then
-                            setOrder[#setOrder + 1] = false  -- sentinel for "Other" bucket
-                        end
-
-                        for _, sid in ipairs(setOrder) do
-                            local subItems = sid and setItems[sid] or otherItems
-                            if #subItems > 0 then
-                                setGearSubIdx = setGearSubIdx + 1
-                                local sh = GetOrCreateSetGearSubHeader(setGearSubIdx)
-                                sh:SetParent(child)
-                                sh:ClearAllPoints()
-                                sh:SetPoint("TOPLEFT", child, "TOPLEFT", startX + 4, curY)
-                                sh:SetWidth(gridW - 8)
-                                if sid then
-                                    local setName, setIcon = C_EquipmentSet.GetEquipmentSetInfo(sid)
-                                    sh._label:SetText((setName or "?") .. " (" .. #subItems .. ")")
-                                    if setIcon and setIcon ~= 0 then
-                                        sh._icon:SetTexture(setIcon)
-                                        sh._icon:Show()
-                                    else
-                                        sh._icon:Hide()
-                                    end
-                                else
-                                    sh._label:SetText("Other (" .. #subItems .. ")")
-                                    sh._icon:Hide()
-                                end
-                                sh:Show()
-                                curY = curY - 18
-
-                                RenderItemBlock(subItems)
-                                curY = curY - 4  -- small gap between sets
-                            end
-                        end
+                        RenderSetGearSubGroups(catItems)
                         curY = curY - 2
                     else
                         RenderSection(cat.name, catItems, isUserCreated, cat.isPinned, cat.isRecent, ci, true)
@@ -6160,7 +6208,7 @@ function EUI_BagsReagent:RefreshInventory()
             btn:SetItemButtonTexture(data.info.iconFileID)
             btn:SetItemButtonCount(data.info.stackCount)
             SetItemButtonDesaturated(btn, data.info.isLocked)
-            local filtered = data.info.isFiltered
+            local filtered = not (EUI_FilterEngine and EUI_FilterEngine:IsActive()) and data.info.isFiltered
             btn:SetAlpha(filtered and 0.2 or 1)
             if btn._textOverlay then btn._textOverlay:SetAlpha(filtered and 0.2 or 1) end
 
