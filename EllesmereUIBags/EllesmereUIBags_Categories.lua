@@ -299,7 +299,7 @@ end
 -------------------------------------------------------------------------------
 --  Classification
 -------------------------------------------------------------------------------
--- Equipment set lookup: built once per ClassifyAll pass, maps "bag:slot" -> true
+-- Equipment set lookup: built once per ClassifyAll pass, maps "bag*1000+slot" -> setID
 local _setGearLookup = {}
 
 local function BuildSetGearLookup()
@@ -313,12 +313,22 @@ local function BuildSetGearLookup()
                 if loc and loc ~= 0 and loc ~= 1 and loc ~= -1 then
                     local data = EquipmentManager_GetLocationData(loc)
                     if data.isBags then
-                        _setGearLookup[data.bag * 1000 + data.slot] = true
+                        local key = data.bag * 1000 + data.slot
+                        -- A slot can belong to multiple sets; keep first for icon purposes
+                        if not _setGearLookup[key] then
+                            _setGearLookup[key] = setID
+                        end
                     end
                 end
             end
         end
     end
+end
+
+-- Returns the equipment setID for the given bag/slot, or nil if not set gear.
+-- Valid only after ClassifyAll has been called this frame.
+function CategoryManager:GetItemSetID(bag, slot)
+    return _setGearLookup[bag * 1000 + slot]
 end
 
 -- Manual overrides: itemID -> classID
@@ -469,6 +479,12 @@ function CategoryManager:ClassifyAll(items)
                 idx = catchAllIdx
             end
             data.categoryIndex = idx
+            -- Stamp equipment set ID so the renderer can sub-group by set
+            if idx and cats[idx] and cats[idx].isSetGear and data.bag and data.slot then
+                data._setGearSetID = _setGearLookup[data.bag * 1000 + data.slot]
+            else
+                data._setGearSetID = nil
+            end
             if idx then
                 counts[idx] = (counts[idx] or 0) + 1
             end

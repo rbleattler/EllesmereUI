@@ -2531,6 +2531,13 @@ local function RenderButton(btn, data, _, col, row, startX, currentY, _, interac
             end
         end
 
+        -- Notify addon compatibility hooks that this button has been updated.
+        -- ContainerFrameItemButtonMixin:UpdateArrow() shows WoW's native upgrade
+        -- arrow and also serves as a hook point for addons like Pawn that attach
+        -- upgrade overlays to ContainerFrameItemButtonTemplate buttons.
+        if btn.UpdateArrow then
+            pcall(btn.UpdateArrow, btn)
+        end
     end
 end
 
@@ -4537,6 +4544,26 @@ local function GetOrCreateExpSubHeader(idx)
     return f
 end
 
+-- Sub-headers for equipment set gear grouping (icon + set name)
+local _setGearSubHeaders = {}
+
+local function GetOrCreateSetGearSubHeader(idx)
+    if _setGearSubHeaders[idx] then return _setGearSubHeaders[idx] end
+    local f = CreateFrame("Frame", nil, EUI_Bags)
+    f:SetHeight(18)
+    f._icon = f:CreateTexture(nil, "ARTWORK")
+    f._icon:SetSize(14, 14)
+    f._icon:SetPoint("LEFT", f, "LEFT", 0, 0)
+    f._icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    f._label = f:CreateFontString(nil, "OVERLAY")
+    SetBagFont(f._label, 9)
+    f._label:SetPoint("LEFT", f._icon, "RIGHT", 3, 0)
+    f._label:SetTextColor(0.65, 0.65, 0.65)
+    f._label:SetJustifyH("LEFT")
+    _setGearSubHeaders[idx] = f
+    return f
+end
+
 -------------------------------------------------------------------------------
 --  Scroll Frame + Scrollbar for item grid
 -------------------------------------------------------------------------------
@@ -4746,13 +4773,15 @@ function EUI_Bags:RefreshInventory()
                             d._giTrackColor = trackColor
                         end
                     end
-                    -- Warbound check (warbank dim overlay) + WuE bind check (gear only, when bind-type text is enabled).
+                    -- Warbound check (warbank dim overlay) + WuE bind check (gear only).
+                    -- Always check _isWuE for gear so search keywords work regardless of
+                    -- whether the BoE display option is enabled.
                     local loc = ItemLocation:CreateFromBagAndSlot(bag, slot)
                     if loc and C_Item.DoesItemExist(loc) then
                         if C_Bank and C_Bank.IsItemAllowedInBankType then
                             d._isWarbound = C_Bank.IsItemAllowedInBankType(Enum.BankType.Account, loc)
                         end
-                        if isGear and not info.isBound and BP().bagDisplayBindType then
+                        if isGear and not info.isBound and C_Item.IsBoundToAccountUntilEquip then
                             d._isWuE = C_Item.IsBoundToAccountUntilEquip(loc)
                         end
                     end
@@ -4944,6 +4973,9 @@ function EUI_Bags:RefreshInventory()
         SetBagFont(hdr._hint, catTitleSize - 1)
     end
     for _, sh in pairs(_expSubHeaders) do
+        sh:Hide()
+    end
+    for _, sh in pairs(_setGearSubHeaders) do
         sh:Hide()
     end
     if EUI_Bags._pinOverlayBtn then EUI_Bags._pinOverlayBtn:Hide() end
@@ -5383,6 +5415,7 @@ function EUI_Bags:RefreshInventory()
         local renderedGroups = {}
         local headerIdx = 0
         local expSubIdx = 0
+        local setGearSubIdx = 0
 
         local function RenderItemBlock(blockItems)
             local n = #blockItems
@@ -5662,7 +5695,72 @@ function EUI_Bags:RefreshInventory()
                 if not hiddenSet[cat._defaultName] then
                     local catItems = itemsByCat[ci] or {}
                     local isUserCreated = cat.isUserCreated
-                    RenderSection(cat.name, catItems, isUserCreated, cat.isPinned, cat.isRecent, ci, true)
+                    if cat.isSetGear and #catItems > 0 then
+                        -- Equipment set gear: render main header then sub-group by set
+                        headerIdx = headerIdx + 1
+                        local hdr = GetOrCreateCatHeader(headerIdx)
+                        hdr:SetParent(child)
+                        hdr:ClearAllPoints()
+                        hdr:SetPoint("TOPLEFT", child, "TOPLEFT", startX, curY)
+                        hdr:SetWidth(gridW)
+                        hdr._label:SetText(cat.name .. " (" .. #catItems .. ")")
+                        hdr._hint:SetText("")
+                        hdr:Show()
+                        curY = curY - 22
+
+                        -- Group by _setGearSetID; items without a setID land in an "Other" bucket
+                        local setOrder = {}      -- ordered list of setIDs (first-seen order)
+                        local setItems = {}      -- setID -> { items }
+                        local otherItems = {}
+                        for _, data in ipairs(catItems) do
+                            local sid = data._setGearSetID
+                            if sid then
+                                if not setItems[sid] then
+                                    setItems[sid] = {}
+                                    setOrder[#setOrder + 1] = sid
+                                end
+                                setItems[sid][#setItems[sid] + 1] = data
+                            else
+                                otherItems[#otherItems + 1] = data
+                            end
+                        end
+                        if #otherItems > 0 then
+                            setOrder[#setOrder + 1] = false  -- sentinel for "Other" bucket
+                        end
+
+                        for _, sid in ipairs(setOrder) do
+                            local subItems = sid and setItems[sid] or otherItems
+                            if #subItems > 0 then
+                                setGearSubIdx = setGearSubIdx + 1
+                                local sh = GetOrCreateSetGearSubHeader(setGearSubIdx)
+                                sh:SetParent(child)
+                                sh:ClearAllPoints()
+                                sh:SetPoint("TOPLEFT", child, "TOPLEFT", startX + 4, curY)
+                                sh:SetWidth(gridW - 8)
+                                if sid then
+                                    local setName, setIcon = C_EquipmentSet.GetEquipmentSetInfo(sid)
+                                    sh._label:SetText((setName or "?") .. " (" .. #subItems .. ")")
+                                    if setIcon and setIcon ~= 0 then
+                                        sh._icon:SetTexture(setIcon)
+                                        sh._icon:Show()
+                                    else
+                                        sh._icon:Hide()
+                                    end
+                                else
+                                    sh._label:SetText("Other (" .. #subItems .. ")")
+                                    sh._icon:Hide()
+                                end
+                                sh:Show()
+                                curY = curY - 18
+
+                                RenderItemBlock(subItems)
+                                curY = curY - 4  -- small gap between sets
+                            end
+                        end
+                        curY = curY - 2
+                    else
+                        RenderSection(cat.name, catItems, isUserCreated, cat.isPinned, cat.isRecent, ci, true)
+                    end
                 end
             end
         end
