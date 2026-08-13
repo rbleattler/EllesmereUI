@@ -1,3 +1,4 @@
+if EUI_CLIENT_BLOCKED then return end -- pre-12.1 client failsafe (EllesmereUI_ClientGate.lua)
 -------------------------------------------------------------------------------
 --  EllesmereUIBags_Bank.lua
 --  Bank UI module - opens when interacting with a banker NPC
@@ -180,7 +181,7 @@ local function GetWarbandBankTabs()
                     local name = td.name or ("Tab " .. i)
                     local icon = td.icon
                     if not icon or icon == 134400 then icon = GetFallbackIcon(bagID) end
-                    tabs[#tabs + 1] = { bagID = bagID, numSlots = numSlots, name = "Warbank " .. name, icon = icon, depositFlags = td.depositFlags or 0 }
+                    tabs[#tabs + 1] = { bagID = bagID, numSlots = numSlots, name = EUI.L("Warbank") .. " " .. name, icon = icon, depositFlags = td.depositFlags or 0 }
                 end
             end
         end
@@ -188,7 +189,7 @@ local function GetWarbandBankTabs()
         for i, bagID in ipairs(WARBAND_BANK_BAGS) do
             local numSlots = C_Container.GetContainerNumSlots(bagID)
             if numSlots > 0 then
-                tabs[#tabs + 1] = { bagID = bagID, numSlots = numSlots, name = "Warbank Tab " .. #tabs + 1, icon = GetFallbackIcon(bagID), depositFlags = 0 }
+                tabs[#tabs + 1] = { bagID = bagID, numSlots = numSlots, name = EUI.L("Warbank") .. " Tab " .. #tabs + 1, icon = GetFallbackIcon(bagID), depositFlags = 0 }
             end
         end
     end
@@ -842,7 +843,7 @@ local function EnsureBankTabConfigFrame()
         local displayName = tabData.name
         if self.bankType == Enum.BankType.Account then
             -- Remove "Warbank " prefix as this is a prefix added by EUI and not the real tab name. This is necessary to edit the tab
-            local prefix = "Warbank "
+            local prefix = EUI.L("Warbank") .. " "
             local prefix_len = #prefix
             if strsub(tabData.name, 1, prefix_len) == prefix then
                 displayName = strsub(tabData.name, prefix_len + 1)
@@ -1200,16 +1201,15 @@ end
 -------------------------------------------------------------------------------
 --  TradeSkillMaster compatibility
 -------------------------------------------------------------------------------
--- TSM decides whether its Banking UI targets the character bank or the
--- warband bank by watching Blizzard's BankPanel, which EUI reparents to a
--- hidden frame, so TSM never sees bank/warbank switches made in the EUI
--- sidebar. TSM supports addon-provided bank frames through two globals
--- (TSM Core/Service/Banking/Core.lua): it calls Addon_GetBankType() to
--- read the active bank type, and hooksecurefunc's Addon_SetBankType at
--- init so it can re-check whenever the view changes. Both globals must
--- exist before TSM initializes; EUI loads first alphabetically. Cost when
--- TSM is absent is one comparison per RefreshBank. Guarded so another bag
--- addon that already implements the contract wins.
+-- TSM decides whether its Banking UI targets the character bank or the warband bank by
+-- watching Blizzard's BankPanel, which EUI reparents to a hidden frame, so TSM never
+-- sees bank/warbank switches made in the EUI sidebar. TSM supports addon-provided bank
+-- frames through two globals (TSM Core/Service/Banking/Core.lua): it calls
+-- Addon_GetBankType() to read the active bank type, and hooksecurefunc's
+-- Addon_SetBankType at init so it can re-check whenever the view changes. Both globals
+-- must exist before TSM initializes; EUI loads first alphabetically. Cost when TSM is
+-- absent is one comparison per RefreshBank. Guarded so another bag addon that already
+-- implements the contract wins.
 
 local _lastTSMBankType = nil
 
@@ -1765,12 +1765,12 @@ function EUI_Bank:RefreshBank()
     if _selectedView == -1 then
         -- OneBank: character bank only, flat with "Bank" header
         local slots, filled = BuildOneView(charTabs)
-        LayoutFlatSlots(slots, "Bank (" .. filled .. " / " .. #slots .. ")")
+        LayoutFlatSlots(slots, EllesmereUI.Lf("Bank (%1$d / %2$d)", filled, #slots))
 
     elseif _selectedView == -3 then
         -- OneWarbank: warband bank only, flat with "Warband Bank" header
         local slots, filled = BuildOneView(warbTabs)
-        LayoutFlatSlots(slots, "Warband Bank (" .. filled .. " / " .. #slots .. ")")
+        LayoutFlatSlots(slots, EllesmereUI.Lf("Warband Bank (%1$d / %2$d)", filled, #slots))
 
     elseif _selectedView == -2 then
         -- All Warbank Tabs: per-tab headers for warband only
@@ -2457,11 +2457,10 @@ eventFrame:SetScript("OnEvent", function(_, event)
     end
 end)
 
--- Kill Blizzard bank frame: reparent to hidden frame only.
--- Do NOT call BankFrame:Hide() -- that fires BANKFRAME_CLOSED and kills
--- the bank interaction. Reparenting is invisible to the event system.
--- Do NOT use SetScript on BankFrame -- that taints it and breaks
--- PurchaseBankTab() and other secure bank operations.
+-- Kill Blizzard bank frame: reparent to hidden frame only. Do NOT call BankFrame:Hide()
+-- -- that fires BANKFRAME_CLOSED and kills the bank interaction. Reparenting is
+-- invisible to the event system. Do NOT use SetScript on BankFrame -- that taints it
+-- and breaks PurchaseBankTab() and other secure bank operations.
 do
     local hiddenParent = CreateFrame("Frame")
     hiddenParent:Hide()

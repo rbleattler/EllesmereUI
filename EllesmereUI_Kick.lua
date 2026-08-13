@@ -1,3 +1,4 @@
+if EUI_CLIENT_BLOCKED then return end -- pre-12.1 client failsafe (EllesmereUI_ClientGate.lua)
 --------------------------------------------------------------------------------
 --  EllesmereUI_Kick.lua
 --  Shared interrupt spell lookup and cast-bar tint helpers for nameplates
@@ -24,15 +25,14 @@ local activeKickSpell
 
 -- A summoned demon's interrupt beats anything the player bank still reports.
 --
--- The two banks were previously treated as one pool and the loop kept the LAST
--- match, so resolution depended on this table's ORDER rather than on what the
--- player can actually cast. A Demonology Warlock with a Felguard out has Axe
--- Toss as their only interrupt, but a later Warlock entry also answered as
--- known, overwrote it, and left the cast bar reading the cooldown of a spell
--- that never fires. Kicking changed nothing on screen: the bar stayed tinted
--- "interrupt ready" and the kick-prediction tick, which reads the same spell,
--- was wrong for the same reason. Other specs were unaffected because only one
--- of their entries ever answers.
+-- The two banks were previously treated as one pool and the loop kept the LAST match,
+-- so resolution depended on this table's ORDER rather than on what the player can
+-- actually cast. A Demonology Warlock with a Felguard out has Axe Toss as their only
+-- interrupt, but a later Warlock entry also answered as known, overwrote it, and left
+-- the cast bar reading the cooldown of a spell that never fires. Kicking changed
+-- nothing on screen: the bar stayed tinted "interrupt ready" and the kick-prediction
+-- tick, which reads the same spell, was wrong for the same reason. Other specs were
+-- unaffected because only one of their entries ever answers.
 --
 -- Last-match is preserved WITHIN each bank so no other class's resolution
 -- changes; only the pet-over-player precedence is new.
@@ -101,13 +101,57 @@ EllesmereUI.ComputeCastBarTint = ComputeCastBarTint
 -- frames AND header-managed (party/raid) frames whose unit changes. Call
 -- AttachSecureUnitMenu(frame) on any unit button that needs a right-click menu
 -- instead of setting *type2 = "togglemenu".
+-- 12.1 zoned-out raid member -> PET menu misclassification fix. The proxy's
+-- "togglemenu" secure action classifies the menu through a UnitIsUnit chain
+-- that checks "pet" BEFORE UnitIsPlayer, and its token special-cases cover
+-- party/boss/focus/arena but NOT raid (SecureTemplates.lua SECURE_ACTIONS.
+-- togglemenu, marked "Unused by Blizzard code" -- the default UI never runs
+-- it, which is why base frames don't show the bug; party frames are immune
+-- via the token special-case, matching the raid-only field report). For a
+-- raid member whose unit data has not streamed (zoned elsewhere), the
+-- engine-side UnitIsUnit(raidN, "pet") comparison can misfire and the whole
+-- chain resolves PET. Post-hook the opener: a PET-family menu opening for a
+-- raid/party token whose GUID is a Player is that exact misfire -- re-open
+-- the correct player menu. The re-open runs from this (tainted) hook, so
+-- protected items (Set Focus/Follow) can throw for THAT menu instance only;
+-- the trade for not showing a pet menu on a player. Legitimate pet menus
+-- (unit "pet"/"partypetN"/"raidpetN") never match the signature, and the
+-- correct which comes from the TOKEN (no unit APIs -- UnitInRaid/identity
+-- reads can be SECRET for exactly these unstreamed units). Installed lazily
+-- with the first menu proxy; zero cost until a menu actually opens.
+local menuFixHooked = false
+local function InstallMenuClassifierFix()
+    if menuFixHooked or type(UnitPopup_OpenMenu) ~= "function" then return end
+    menuFixHooked = true
+    local reopening = false
+    hooksecurefunc("UnitPopup_OpenMenu", function(which, contextData)
+        if reopening then return end
+        if which ~= "PET" and which ~= "OTHERPET" and which ~= "OTHERBATTLEPET" then return end
+        local unit = contextData and contextData.unit
+        if type(unit) ~= "string" then return end
+        local lu = unit:lower()
+        local isRaidToken = lu:match("^raid[0-9]+$") ~= nil
+        if not isRaidToken and not lu:match("^party[0-9]+$") then return end
+        local guid = UnitGUID(unit)
+        if issecretvalue and issecretvalue(guid) then return end
+        if type(guid) ~= "string" or not guid:find("^Player%-") then return end
+        reopening = true
+        -- FRESH context table, never the inbound one: OpenMenu ENRICHES its
+        -- contextData in place (playerLocation/accountInfo) and asserts those
+        -- fields are nil on entry -- re-passing the first open's table throws
+        -- "assertion failed" at UnitPopupShared:53 (field-caught 2026-08-14;
+        -- the live misfire classifies as OTHERBATTLEPET, same field capture).
+        UnitPopup_OpenMenu(isRaidToken and "RAID_PLAYER" or "PARTY", { unit = unit })
+        reopening = false
+    end)
+end
+
 local menuProxies = setmetatable({}, { __mode = "k" })
 -- 12.1: proxies are GLOBALLY NAMED so bindings can reach them via "/click
 -- <name>" (macro transport). 12.1 broke the "click" secure action outright
 -- (a typo: SecureTemplates.lua:564 calls HasAnyForbiddenAspects on the
 -- mouse-button STRING instead of the delegate); /click hits
--- SecureActionButton_OnClick directly and is unaffected. On 12.0 the click
--- transport works and proxies stay anonymous.
+-- SecureActionButton_OnClick directly and is unaffected.
 local proxyCounter = 0
 
 -- Create (once) and return the hidden SecureActionButton proxy for a unit button.
@@ -115,13 +159,12 @@ local proxyCounter = 0
 -- touch the frame's own type attributes (so it won't clobber other bindings).
 function EllesmereUI.GetSecureMenuProxy(frame)
     if not frame then return end
+    InstallMenuClassifierFix()
     local proxy = menuProxies[frame]
     if not proxy then
         local proxyName
-        if EllesmereUI.IS_121 then
-            proxyCounter = proxyCounter + 1
-            proxyName = "EUISecureMenuProxy" .. proxyCounter
-        end
+        proxyCounter = proxyCounter + 1
+        proxyName = "EUISecureMenuProxy" .. proxyCounter
         proxy = CreateFrame("Button", proxyName, frame, "SecureActionButtonTemplate")
         proxy:SetSize(1, 1)
         proxy:SetAlpha(0)
@@ -153,10 +196,8 @@ function EllesmereUI.GetSecureTargetProxy(frame)
     local proxy = targetProxies[frame]
     if not proxy then
         local proxyName
-        if EllesmereUI.IS_121 then
-            proxyCounter = proxyCounter + 1
-            proxyName = "EUISecureTargetProxy" .. proxyCounter
-        end
+        proxyCounter = proxyCounter + 1
+        proxyName = "EUISecureTargetProxy" .. proxyCounter
         proxy = CreateFrame("Button", proxyName, frame, "SecureActionButtonTemplate")
         proxy:SetSize(1, 1)
         proxy:SetAlpha(0)
@@ -180,16 +221,11 @@ function EllesmereUI.AttachSecureUnitMenu(frame)
     if not frame then return end
     local proxy = EllesmereUI.GetSecureMenuProxy(frame)
     frame:SetAttribute("type2", nil)
-    if EllesmereUI.IS_121 then
-        -- Macro transport ("/click <proxy>") instead of the "click" action:
-        -- the 12.1 click action crashes on a Blizzard typo (see above).
-        frame:SetAttribute("*type2", "macro")
-        frame:SetAttribute("*macrotext2", "/click " .. proxy:GetName())
-        frame:SetAttribute("*clickbutton2", nil)
-    else
-        frame:SetAttribute("*type2", "click")
-        frame:SetAttribute("*clickbutton2", proxy)
-    end
+    -- Macro transport ("/click <proxy>") instead of the "click" action:
+    -- the 12.1 click action crashes on a Blizzard typo (see above).
+    frame:SetAttribute("*type2", "macro")
+    frame:SetAttribute("*macrotext2", "/click " .. proxy:GetName())
+    frame:SetAttribute("*clickbutton2", nil)
     return proxy
 end
 

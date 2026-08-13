@@ -1,10 +1,10 @@
 ## Interface: 120000, 120001, 120005, 120007, 120100
-## Title: |cff0cd29fEllesmereUI|r Mythic+ Timer
+## Title: |cff0cd29fEllesmereUI|r Mythic+ Tools
 ## Category: |cff0cd29fEllesmere|rUI
 ## Group: EllesmereUI
 ## Notes: A simple Mythic+ timer with full tracking customizations.
 ## Author: Ellesmere
-## Version: 8.7.8
+## Version: 8.8.6
 ## Dependencies: EllesmereUI
 ## SavedVariables: EllesmereUIMythicTimerDB
 ## IconTexture: Interface\AddOns\EllesmereUI\media\eg-logo.tga
@@ -12,5 +12,8 @@
 # Main Lua
 EllesmereUIMythicTimer.lua
 
+# Mythic+ Tools features
+EUI_MythicTimer_TargetedSpellBars.lua
+EUI_MythicTimer_TargetFocusBars.lua
+
 # Options
-EUI_MythicTimer_Options.lua

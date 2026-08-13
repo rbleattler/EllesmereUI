@@ -1,7 +1,10 @@
+if EUI_CLIENT_BLOCKED then return end -- pre-12.1 client failsafe (EllesmereUI_ClientGate.lua)
 -------------------------------------------------------------------------------
 --  EllesmereUIMythicTimer.lua  —  M+ Timer overlay for EllesmereUI
 -------------------------------------------------------------------------------
 local ADDON_NAME, ns = ...
+if not (EllesmereUI and EllesmereUI._ModuleNS) then EUI_CLIENT_BLOCKED = true; return end -- stale-parent guard: a partially updated install (old parent, new child) goes dormant via the line-1 failsafe instead of erroring
+EllesmereUI._ModuleNS[ADDON_NAME] = ns  -- LOD options files read this module ns via the registry
 local EMT = EllesmereUI.Lite.NewAddon(ADDON_NAME)
 
 -- Upvalues
@@ -182,6 +185,77 @@ local DB_DEFAULTS = {
         deathTextColor    = { r = 0.93, g = 0.33, b = 0.33 },
         enemyBarUseAccent = true,
         enemyBarColor     = { r = 0.35, g = 0.55, b = 0.8 },
+        -- Targeted Spell Bars (Mythic+ Tools tab): replica nameplate cast bars
+        -- collected into one movable group. Disabled by default; the feature
+        -- registers its events only while enabled (zero cost off). Runtime in
+        -- EUI_MythicTimer_TargetedSpellBars.lua.
+        tsb = {
+            enabled          = false,
+            growUp           = false,  -- false = new bars stack downward
+            width            = 240,
+            height           = 20,
+            spacing          = 4,
+            maxBars          = 5,
+            texture          = "none",
+            barColor         = { r = 0.70, g = 0.40, b = 0.90 },
+            bgColor          = { r = 0, g = 0, b = 0, a = 0.45 },
+            borderSize       = 1,
+            showIcon         = true,
+            showSpellName    = true,
+            nameSize         = 10,
+            nameX            = 0,
+            nameY            = 0,
+            showTarget       = true,
+            targetSize       = 10,
+            targetX          = 0,
+            targetY          = 0,
+            targetClassColor = true,
+            targetColor      = { r = 1, g = 1, b = 1 },
+            showTimer        = true,
+            timerSize        = 10,
+            timerX           = 0,
+            timerY           = 0,
+        },
+        -- Target/Focus standalone cast bars (Mythic+ Tools tab): unlock-mode
+        -- placeable cast bars carrying the nameplate interrupt color/effects
+        -- system. Both disabled by default. Runtime in
+        -- EUI_MythicTimer_TargetFocusBars.lua.
+        tfb = {
+            castColor        = { r = 0.70, g = 0.40, b = 0.90 },
+            interruptReady   = { r = 0.92, g = 0.35, b = 0.20 },
+            uninterruptible  = { r = 0.45, g = 0.45, b = 0.45 },
+            importantColor   = { r = 1, g = 0.2, b = 0.2 },
+            importantEnabled = false,
+            midCastColor     = { r = 0.318, g = 0.820, b = 0.357 },
+            kickTickColor    = { r = 1, g = 1, b = 1 },
+            kickTickEnabled  = true,
+            midCastEnabled   = false,
+            showShield       = true,
+            showSpark        = true,
+            interruptedFlash = true,
+            interruptedColor = { r = 0.8, g = 0, b = 0 },
+            showTarget       = true,
+            targetClassColor = true,
+            targetColor      = { r = 1, g = 1, b = 1 },
+            target = {
+                enabled = false,
+                width = 260, height = 22,
+                texture = "none",
+                showIcon = true,
+                showSpellName = true, nameSize = 11,
+                showTimer = true, timerSize = 11,
+                targetSize = 10,
+            },
+            focus = {
+                enabled = false,
+                width = 260, height = 22,
+                texture = "none",
+                showIcon = true,
+                showSpellName = true, nameSize = 11,
+                showTimer = true, timerSize = 11,
+                targetSize = 10,
+            },
+        },
     },
 }
 
@@ -711,13 +785,12 @@ local function TrackerShouldBeHidden()
     return false
 end
 
--- ObjectiveTrackerFrame is EditMode-managed: its Hide() routes through the
--- system template to HideBase(), which is protected, so calling it from our
--- execution during combat is blocked (ADDON_ACTION_BLOCKED). In combat,
--- suppress with alpha only (top-level frame, never children, never mouse
--- state) and finish the real Hide once combat drops. The regen listener is
--- one-shot: it unregisters on fire and is re-registered by each new
--- in-combat request.
+-- ObjectiveTrackerFrame is EditMode-managed: its Hide() routes through the system
+-- template to HideBase(), which is protected, so calling it from our execution during
+-- combat is blocked (ADDON_ACTION_BLOCKED). In combat, suppress with alpha only
+-- (top-level frame, never children, never mouse state) and finish the real Hide once
+-- combat drops. The regen listener is one-shot: it unregisters on fire and is
+-- re-registered by each new in-combat request.
 local _trackerRegenFrame
 local function HideTracker(otf)
     if InCombatLockdown() then
@@ -897,11 +970,10 @@ local PREVIEW_RUN = {
     },
 }
 
--- The preview is a hardcoded dummy run, so its dungeon and affix names would
--- stay English on every client. Both carry an ID and the live-run path already
--- resolves names from those same IDs, so do the same here. When an ID is not in
--- the current season the API returns nil, so the hardcoded English falls back
--- through L() instead.
+-- The preview is a hardcoded dummy run, so its dungeon and affix names would stay
+-- English on every client. Both carry an ID and the live-run path already resolves
+-- names from those same IDs, so do the same here. When an ID is not in the current
+-- season the API returns nil, so the hardcoded English falls back through L() instead.
 local function LocalizePreview()
     local run = PREVIEW_RUN
     if C_ChallengeMode and C_ChallengeMode.GetMapUIInfo then
@@ -1027,13 +1099,12 @@ ns.ApplyBorder = function()
     local texKey = p.borderTexture or "solid"
     local r, g, b, a = p.borderR or 0, p.borderG or 0, p.borderB or 0, p.borderA or 1
 
-    -- Main timer bar.
-    -- In SEGMENTS mode "_barBg" is only an invisible (Alpha 0) but still
-    -- :IsShown() texture that spans the ENTIRE bar width (including the gaps
-    -- between segments). Bordering it here would draw a border line in the gaps
-    -- too (left/right is hidden by the adjacent segment border, top/bottom is
-    -- not), so in SEGMENTS mode the main border is disabled here; the individual
-    -- segment borders below draw the complete outline.
+    -- Main timer bar. In SEGMENTS mode "_barBg" is only an invisible (Alpha 0) but
+    -- still :IsShown() texture that spans the ENTIRE bar width (including the gaps
+    -- between segments). Bordering it here would draw a border line in the gaps too
+    -- (left/right is hidden by the adjacent segment border, top/bottom is not), so in
+    -- SEGMENTS mode the main border is disabled here; the individual segment borders
+    -- below draw the complete outline.
     local isSegmented = (p.timerBarStyle == "SEGMENTS")
     if isSegmented then
         ApplyBorderTo(f, f._barBg, "_emtBarBorderFrame", p, 0, texKey, r, g, b, a)
@@ -1642,9 +1713,8 @@ local function RenderStandalone()
     local timerText
     local timerDetailText
     if run.completed then
-        -- Completed run: freeze the clock at the final elapsed seconds
-        -- but preserve the user's chosen display mode so "/33:00" doesn't
-        -- vanish on completion.
+        -- Completed run: freeze the clock at the final elapsed seconds but preserve the
+        -- user's chosen display mode so "/33:00" doesn't vanish on completion.
         local mode = p.timerDisplayMode or "REMAINING_TOTAL"
         local elaStr = FormatTime(run.elapsed or completedElapsed or 0)
         local maxStr = FormatTime(maxTime)
@@ -2082,11 +2152,10 @@ local function RenderStandalone()
             -- and the live clock (e.g. "33:00") gets ellipsized. Once per key change.
             local templ = (timerText or ""):gsub("%d", WidestDigitChar(f._timerFS))
             f._timerFS:SetText(templ)
-            -- Keep the SetTextDiff cache in sync with what we just wrote
-            -- directly. Otherwise the cache still reflects the previous
-            -- timerText, so the restore call below short-circuits and
-            -- the "99:99" template stays visible (bug seen during the
-            -- 10-second pre-start window where elapsed stays at 0).
+            -- Keep the SetTextDiff cache in sync with what we just wrote directly.
+            -- Otherwise the cache still reflects the previous timerText, so the restore
+            -- call below short-circuits and the "99:99" template stays visible (bug
+            -- seen during the 10-second pre-start window where elapsed stays at 0).
             f._timerFS._lastText = templ
             -- Clear any previously pinned width BEFORE measuring. With wrap off,
             -- GetStringWidth() returns a value CLAMPED to the current width whenever
@@ -2586,11 +2655,10 @@ _G._EMT_RebuildStandalone = function()
     RenderStandalone()
 end
 
--- One-time migration of legacy TOPLEFT-stored position into stable centerX/Y
--- offsets relative to UIParent center. Must run BEFORE SetScale so the
--- derived center reflects the unscaled frame; otherwise repeated calls
--- after SetScale would compute a different center each time and the frame
--- would drift.
+-- One-time migration of legacy TOPLEFT-stored position into stable centerX/Y offsets
+-- relative to UIParent center. Must run BEFORE SetScale so the derived center reflects
+-- the unscaled frame; otherwise repeated calls after SetScale would compute a different
+-- center each time and the frame would drift.
 local function _ensureCenterPos()
     local pos = db and db.profile and db.profile.standalonePos
     if not pos then return end
@@ -2729,9 +2797,8 @@ runtimeFrame:SetScript("OnEvent", function(_, event)
     end
     HandleRuntimeEvent(event)
 
-    -- Toggle high-frequency event subscriptions based on whether we're
-    -- actually in a key. Outside M+ we don't want to wake on every quest
-    -- update or subzone change.
+    -- Toggle high-frequency event subscriptions based on whether we're actually in a
+    -- key. Outside M+ we don't want to wake on every quest update or subzone change.
     if currentRun.active then
         _registerRunEvents()
     else
@@ -2786,6 +2853,11 @@ function EMT:OnInitialize()
 end
 
 function EMT:OnEnable()
+    -- Mythic+ Tools features initialize BEFORE the timer's own enable guard:
+    -- they carry their own per-feature enable flags and must work with the
+    -- timer feature turned off. Both are no-ops while their flags are off.
+    if ns.TSB_OnEnable then ns.TSB_OnEnable(db) end
+    if ns.TFB_OnEnable then ns.TFB_OnEnable(db) end
     if not db or not db.profile.enabled then return end
 
     if EllesmereUI and EllesmereUI.RegisterUnlockModeListener then
@@ -2878,11 +2950,10 @@ function EMT:OnEnable()
                     -- mode fixes it" field report (/emtdbg capture: our apply
                     -- wrote 696.3 at scale 1.26 = 877 on screen, then the
                     -- centralized pass stomped it with 552.6 = 696 on
-                    -- screen). At scale 1.0 both forms are identical, which
-                    -- is why only scaled timers ever drifted. The /scale
-                    -- division belongs ONLY at the module's own SetPoint
-                    -- (ApplyStandalonePosition / _centerPosFromSaved), never
-                    -- in the interchange format.
+                    -- screen). At scale 1.0 both forms are identical, which is why only
+                    -- scaled timers ever drifted. The /scale division belongs ONLY at
+                    -- the module's own SetPoint (ApplyStandalonePosition /
+                    -- _centerPosFromSaved), never in the interchange format.
                     local pos = db.profile.standalonePos
                     if not (pos and pos.centerX and pos.centerY) then return nil end
                     return {

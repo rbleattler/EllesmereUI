@@ -4,13 +4,13 @@
 ## Group: EllesmereUI
 ## Notes: A beautiful visual refresh of Blizzard Bags with intuitive organization.
 ## Author: Ellesmere
-## Version: 8.7.8
+## Version: 8.8.6
 ## Dependencies: EllesmereUI
 ## SavedVariables: EllesmereUIBagsDB
 ## IconTexture: Interface\AddOns\EllesmereUI\media\eg-logo.tga
 
-# Options
-EUI_Bags_Options.lua
+# Module database (options page lives in EllesmereUIOptions)
+EllesmereUIBags_DB.lua
 
 # Pipeline modules (loaded before core so core can reference them at file scope)
 EllesmereUIBags_FilterEngine.lua

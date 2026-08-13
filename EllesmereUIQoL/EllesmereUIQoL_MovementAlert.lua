@@ -1,3 +1,4 @@
+if EUI_CLIENT_BLOCKED then return end -- pre-12.1 client failsafe (EllesmereUI_ClientGate.lua)
 -------------------------------------------------------------------------------
 --  EllesmereUIQoL_MovementAlert.lua
 --  Three independent on-screen trackers for class mobility abilities:
@@ -152,6 +153,81 @@ local function GetKnownCategoryDuration(spellId)
         end
     end
     return 0
+end
+
+-- Shared lockout vs. the ability's own cooldown. Casting one charge-type
+-- ability briefly locks out its siblings through a start-recovery/cooldown
+-- category -- Druid Skull Bash does this to Wild Charge for ~2s -- and the
+-- client reports that window through the very same cooldown fields a real
+-- cooldown uses, with isOnGCD false, so the GCD gate above it never catches
+-- it. The discriminator is magnitude: a window far shorter than the ability's
+-- own base cooldown cannot BE that cooldown, so it is not something to alert
+-- on. Blizzard classifies the same way in Blizzard_CooldownViewer
+-- (MIN_GLOBAL_RECOVERY_TIME), just at GCD length. Gated on the base cooldown
+-- being the longer of the two, so a user-added spell that genuinely has a
+-- 1-2s cooldown still tracks normally.
+local MIN_REAL_COOLDOWN = 3
+
+-- entry.baseDuration is learned from LIVE cooldown reads, and those are secret in
+-- instanced content, so an entry first cached there carries no base at all. That
+-- disabled the classifier below exactly where the lockout is most visible: in
+-- combat. Static spell data is not live cooldown state and stays readable, so
+-- fall back to it rather than treating an unknown base as "cannot classify".
+-- GetSpellBaseCooldown is the GLOBAL (client-verified: no C_Spell form exists).
+local function ResolveBaseDuration(entry)
+    local base = entry and entry.baseDuration
+    if type(base) == "number" and not IsSecret(base) then return base end
+    local id = entry and (entry.baseSpellId or entry.spellId)
+    if not id then return 0 end
+    if GetSpellBaseCooldown then
+        local ms = GetSpellBaseCooldown(id)
+        if type(ms) == "number" and not IsSecret(ms) then
+            local secs = ms / 1000
+            if secs > MIN_REAL_COOLDOWN then return secs end
+        end
+    end
+    return GetKnownCategoryDuration(id)
+end
+
+local function IsLockoutWindow(entry, seconds)
+    if type(seconds) ~= "number" or IsSecret(seconds) then return false end
+    local base = ResolveBaseDuration(entry)
+    if type(base) ~= "number" or base <= MIN_REAL_COOLDOWN then return false end
+    return seconds < MIN_REAL_COOLDOWN
+end
+
+-- The same classification when the window is SECRET, which is the case Lua cannot
+-- do at all: IsLockoutWindow refuses a secret and lets it through, so in instanced
+-- content the lockout reached the display with a number on it. Hand the comparison
+-- to the engine instead, with the curve trick the charge-visibility path already
+-- uses: a step curve is 0 below the threshold and 1 above, the duration object
+-- evaluates it in C, and the result drives alpha. Never read the result, only feed it.
+local lockoutAlphaCurve = nil   -- nil = not built, false = API unavailable
+local function GetLockoutAlphaCurve()
+    if lockoutAlphaCurve == nil then
+        if C_CurveUtil and C_CurveUtil.CreateCurve and Enum and Enum.LuaCurveType then
+            local c = C_CurveUtil.CreateCurve()
+            c:SetType(Enum.LuaCurveType.Step)
+            c:AddPoint(0, 0)                   -- cross-ability lockout: hide
+            c:AddPoint(MIN_REAL_COOLDOWN, 1)   -- the ability's own cooldown: show
+            lockoutAlphaCurve = c
+        else
+            lockoutAlphaCurve = false
+        end
+    end
+    return lockoutAlphaCurve or nil
+end
+
+-- 1, or a possibly-secret 0/1 from the engine. Gated on the entry's own base being
+-- the longer of the two, so a user-added spell with a genuine 1-2s cooldown still
+-- tracks normally -- the same condition IsLockoutWindow applies.
+local function LockoutAlpha(entry, duration)
+    if not duration or not duration.EvaluateTotalDuration then return 1 end
+    local base = ResolveBaseDuration(entry)
+    if type(base) ~= "number" or base <= MIN_REAL_COOLDOWN then return 1 end
+    local curve = GetLockoutAlphaCurve()
+    if not curve then return 1 end
+    return duration:EvaluateTotalDuration(curve, 1) or 1
 end
 
 -------------------------------------------------------------------------------
@@ -377,17 +453,17 @@ local function CreateDisplaySlot()
     if slot.icon.cooldown.SetCountdownFont then
         slot.icon.cooldown:SetCountdownFont("EUI_MovementAlertCdFont")
     end
-    -- Own countdown text for icon mode: the engine numbers on a plain
-    -- Cooldown widget only render when the user's countdownForCooldowns
-    -- CVar is on, so the poll drives this FontString instead. The engine
-    -- numbers remain only for secret durations (which Lua cannot format).
+    -- Own countdown text for icon mode: the poll drives this FontString for
+    -- readable durations (our precision/decimal control); the engine numbers
+    -- take over only for secret durations, which Lua cannot format (see the
+    -- engine-countdown block below for the CVar posture).
     slot.icon.timeText = slot.icon.cooldown:CreateFontString(nil, "OVERLAY")
     slot.icon.timeText:SetFontObject(movementCdFont)
     slot.icon.timeText:SetPoint("CENTER")
     slot.icon.timeText:SetText("")
     slot.icon:Hide()
 
-    -- PROTOTYPE: engine-drawn countdown for text modes. See ShowEngineCountdown.
+    -- Engine-drawn countdown for text modes. See ShowEngineCountdown.
     slot.cdNum = CreateFrame("Cooldown", nil, slot, "CooldownFrameTemplate")
     slot.cdNum:SetDrawSwipe(false)
     slot.cdNum:SetDrawEdge(false)
@@ -504,7 +580,7 @@ local function StyleSlot(slot)
 end
 
 -------------------------------------------------------------------------------
---  PROTOTYPE: engine-drawn countdown for the text modes
+--  Engine-drawn countdown for the text modes
 --
 --  A secret remaining cannot be formatted in Lua (that is the 0.0 bug), but
 --  the ENGINE can draw it: a Cooldown widget handed the same duration object
@@ -512,12 +588,12 @@ end
 --  in combat. Everything except the number is switched off here, so all this
 --  widget contributes is text sitting beside the name.
 --
---  The assumption this exists to test: Blizzard READS countdownForCooldowns
---  and passes it into SetHideCountdownNumbers for its own buttons
---  (Blizzard_ActionBar/Shared/ActionButton.lua), so the CVar gates Blizzard's
---  buttons rather than the widget. Forcing false should therefore draw numbers
---  whatever the user's CVar says. The comments elsewhere in this file claim
---  otherwise; if they are right, this renders nothing and the prototype dies.
+--  CVar posture: Blizzard READS countdownForCooldowns and passes it into
+--  SetHideCountdownNumbers for its own buttons (Blizzard_ActionBar/Shared/
+--  ActionButton.lua) -- the CVar gates Blizzard's calls, not the widget
+--  internals -- so forcing false here draws numbers regardless
+--  (field-verified 8.7.8). If a client configuration exists where it does
+--  not, the degradation is no number, same as before this path existed.
 -------------------------------------------------------------------------------
 -- The duration OBJECT is the only safe way to drive this. Cooldown:SetCooldown
 -- is SecretArguments = "AllowedWhenUntainted", so handing it the secret start
@@ -683,14 +759,18 @@ end
 
 local function SafeGetBaseDuration(spellId)
     if C_Spell.GetSpellCooldownDuration then
-        local dur = C_Spell.GetSpellCooldownDuration(spellId)
+        -- ignoreGCD: without it this reads the global cooldown whenever one is
+        -- running, and the 1.5 floor below then throws the answer away.
+        local dur = C_Spell.GetSpellCooldownDuration(spellId, true)
         if dur then
             local total = dur:GetTotalDuration()
             if not IsSecret(total) and total and total > 1.5 then return total end
         end
     end
-    if C_Spell.GetSpellBaseCooldown then
-        local ms = C_Spell.GetSpellBaseCooldown(spellId)
+    -- Global, not C_Spell (client-verified: no C_Spell form exists). Static
+    -- spell data, so it stays readable when the live cooldown is secret.
+    if GetSpellBaseCooldown then
+        local ms = GetSpellBaseCooldown(spellId)
         if not IsSecret(ms) and ms and ms > 1500 then return ms / 1000 end
     end
     local cdInfo = C_Spell.GetSpellCooldown(spellId)
@@ -859,7 +939,11 @@ local function UpdateCachedCharges()
             end
         else
             local cdInfo = C_Spell.GetSpellCooldown(entry.spellId)
-            if cdInfo and cdInfo.duration and not IsSecret(cdInfo.duration) and cdInfo.duration > 0 then
+            -- A shared lockout must not be adopted as the ability's base
+            -- cooldown either -- that would poison the very value
+            -- IsLockoutWindow classifies against.
+            if cdInfo and cdInfo.duration and not IsSecret(cdInfo.duration) and cdInfo.duration > 0
+               and not IsLockoutWindow(entry, cdInfo.duration) then
                 entry.baseDuration = cdInfo.duration
             end
         end
@@ -909,13 +993,37 @@ local function OnBuffActiveSpellCast(castSpellId)
 end
 local function OnPlayerBuffActiveAuraUpdate(updateInfo)
     if not updateInfo then return end
-    if updateInfo.removedAuraInstanceIDs then
+    local removed = updateInfo.removedAuraInstanceIDs
+    local added   = updateInfo.addedAuras
+    -- Restricted content can hand over the payload LISTS themselves as secret
+    -- tables (ipairs on one throws; the per-FIELD PlainValue guards below never
+    -- get a chance to run). Nothing in a secret list is enumerable, so re-derive
+    -- the whole answer from the direct own-aura probe instead -- the same call
+    -- SyncBuffActiveOnCombatStart already makes under restriction, consumed by
+    -- truthiness only. Behavior stays identical in and out of restriction.
+    if IsSecret(removed) or IsSecret(added) then
+        for _, entry in ipairs(cachedMovementSpells) do
+            if entry.checkType == "buffActive" then
+                local key = BuffActiveKey(entry)
+                local aura = C_UnitAuras.GetPlayerAuraBySpellID(key)
+                if aura then
+                    SetBuffActiveState(key, true, aura.auraInstanceID)
+                    expectingBuffAura[key] = nil
+                else
+                    local state = buffActiveState[key]
+                    if state and state.active then SetBuffActiveState(key, false, nil) end
+                end
+            end
+        end
+        return
+    end
+    if removed then
         for _, entry in ipairs(cachedMovementSpells) do
             if entry.checkType == "buffActive" then
                 local key = BuffActiveKey(entry)
                 local state = buffActiveState[key]
                 if state and state.instanceID then
-                    for _, instanceID in ipairs(updateInfo.removedAuraInstanceIDs) do
+                    for _, instanceID in ipairs(removed) do
                         if PlainValue(instanceID) == state.instanceID then
                             SetBuffActiveState(key, false, nil)
                             expectingBuffAura[key] = nil
@@ -926,7 +1034,7 @@ local function OnPlayerBuffActiveAuraUpdate(updateInfo)
             end
         end
     end
-    if updateInfo.addedAuras then
+    if added then
         for _, entry in ipairs(cachedMovementSpells) do
             if entry.checkType == "buffActive" then
                 local key = BuffActiveKey(entry)
@@ -937,7 +1045,7 @@ local function OnPlayerBuffActiveAuraUpdate(updateInfo)
                     -- is no way to tell which is ours, so leave the expectation
                     -- standing rather than latch onto an unrelated aura.
                     local match, unreadable, unreadableCount = nil, nil, 0
-                    for _, aura in ipairs(updateInfo.addedAuras) do
+                    for _, aura in ipairs(added) do
                         local sid = PlainValue(aura.spellId)
                         if sid then
                             if sid == key then match = aura; break end
@@ -952,7 +1060,7 @@ local function OnPlayerBuffActiveAuraUpdate(updateInfo)
                         expectingBuffAura[key] = nil
                     end
                 end
-                for _, aura in ipairs(updateInfo.addedAuras) do
+                for _, aura in ipairs(added) do
                     local sid = PlainValue(aura.spellId)
                     if sid and sid == key and aura.auraInstanceID then
                         SetBuffActiveState(key, true, aura.auraInstanceID)
@@ -1146,7 +1254,7 @@ local function ShowMovementSlot(index, cdInfo, spellEntry, duration)
     -- falls through to the main path, whose engine sinks accept secrets.
     local recov = cdInfo and cdInfo.timeUntilEndOfStartRecovery
     if issecretvalue and issecretvalue(recov) then recov = nil end
-    if type(recov) == "number" and recov > 0 then
+    if type(recov) == "number" and recov > 0 and not IsLockoutWindow(spellEntry, recov) then
         if displayMode == "icon" and spellIcon then
             slot.icon.tex:SetTexture(spellIcon)
             -- Recharge swipe: derived from the entry's recharge duration
@@ -1195,7 +1303,7 @@ local function ShowMovementSlot(index, cdInfo, spellEntry, duration)
             fromDuration = true
             cdRemaining, cdDuration = rem, total
             cdStart, cdModRate = duration:GetStartTime(), duration:GetModRate()
-        elseif total and total > 1.5 and rem and rem > 0 then
+        elseif total and total > 1.5 and not IsLockoutWindow(spellEntry, total) and rem and rem > 0 then
             fromDuration = true
             cdRemaining, cdDuration = rem, total
             cdStart, cdModRate = duration:GetStartTime(), duration:GetModRate()
@@ -1207,7 +1315,10 @@ local function ShowMovementSlot(index, cdInfo, spellEntry, duration)
         if IsSecret(s) or IsSecret(d) then
             hasSecretDuration = true
             cdStart, cdDuration, cdModRate, cdRemaining = s, d, m, true
-        elseif d > 0 then
+        -- This fallback never had the duration-object branch's own GCD floor,
+        -- so anything the branch above rejected as too short landed here and
+        -- rendered anyway.
+        elseif d > 0 and not IsLockoutWindow(spellEntry, d) then
             cdStart, cdDuration, cdModRate = s, d, m
             cdRemaining = math.max(0, (s + d) - GetTime())
         end
@@ -1249,9 +1360,9 @@ local function ShowMovementSlot(index, cdInfo, spellEntry, duration)
                 slot.icon.cooldown:SetHideCountdownNumbers(false)
                 slot.icon.timeText:SetText("")
             else
-                -- Our own countdown text: the engine numbers only render
-                -- when the countdownForCooldowns CVar is on, which most
-                -- users have off -- the poll refreshes this every tick.
+                -- Our own countdown text for readable durations, refreshed by
+                -- the poll every tick; the engine numbers are suppressed here
+                -- and serve only the secret branch.
                 slot.icon.cooldown:SetHideCountdownNumbers(true)
                 slot.icon.timeText:SetFormattedText("%." .. precision .. "f", cdRemaining)
             end
@@ -1317,7 +1428,7 @@ local function ShowMovementSlot(index, cdInfo, spellEntry, duration)
             -- and the text one was wrong. Gating on hasSecretDuration covers
             -- both producers and drops the fragile type() test with it.
             slot.text:SetText("No " .. spellName)
-            -- PROTOTYPE: the number Lua cannot format, drawn by the engine.
+            -- The number Lua cannot format, drawn by the engine.
             if fromDuration then ShowEngineCountdown(slot, displayMode, duration) end
         else
             slot.text:SetFormattedText(fmtStr, cdRemaining)
@@ -1378,8 +1489,9 @@ end
 --  that secret total into a secret ALPHA the engine resolves itself, with no
 --  Lua comparison anywhere -- the same trick Action Bars uses to stop
 --  banked-charge buttons desaturating (desatCurveReal / GetCdAlphaCurve).
---  Non-charge spells are forced back to full alpha so a pooled slot can never
---  keep a stale 0 from a previous occupant.
+--  Non-charge spells get LockoutAlpha instead: 1 in every readable case, and the
+--  engine-resolved 0/1 when a secret window needs classifying -- a pooled slot
+--  still can't keep a stale 0, because this runs for every shown slot each pass.
 -------------------------------------------------------------------------------
 local chargeAlphaCurve = nil   -- nil = not built, false = API unavailable
 local function GetChargeAlphaCurve()
@@ -1397,15 +1509,28 @@ local function GetChargeAlphaCurve()
     return chargeAlphaCurve or nil
 end
 
-local function ApplyChargeVisibility(slot, spellId, chargeInfo)
+local function ApplyChargeVisibility(slot, spellId, chargeInfo, entry, duration)
     if not slot then return end
     -- maxCharges stays PLAIN even when the rest of the charge record is secret,
     -- so this branch is safe (and is why the entry's cached isChargeSpell flag
     -- is not consulted -- SafeGetChargeInfo throws the whole record away when
     -- cooldownDuration is secret, leaving Shift cached as a 1-charge cooldown).
     local mc = chargeInfo and chargeInfo.maxCharges
-    if mc == nil or IsSecret(mc) or mc <= 1 then slot:SetAlpha(1); return end
+    -- Non-charge: the only thing that hides the slot is a cross-ability lockout,
+    -- and when its window is secret the engine-side compare in LockoutAlpha is
+    -- the ONLY way to classify it. This is also the single writer of alpha on
+    -- that path, so it must not be reduced to a bare SetAlpha(1) -- that is what
+    -- let the lockout show through.
+    if mc == nil or IsSecret(mc) or mc <= 1 then
+        slot:SetAlpha(LockoutAlpha(entry, duration))
+        return
+    end
     local curve = GetChargeAlphaCurve()
+    -- Deliberately WITHOUT ignoreGCD: the GCD-length total IS the banked-charge
+    -- signal the step curve keys on (a banked charge reports only a GCD-length
+    -- cooldown; the full recharge drives it only once the last charge is spent).
+    -- Asking the API to skip the GCD would change that signal's class and show
+    -- the alert while a charge is still banked.
     local durObj = C_Spell.GetSpellCooldownDuration and C_Spell.GetSpellCooldownDuration(spellId)
     if curve and durObj and durObj.EvaluateTotalDuration then
         -- Result may be SECRET: never compare it. SetAlpha accepts secrets, and
@@ -1438,17 +1563,37 @@ CheckMovementCooldown = function()
             local spellInfo  = C_Spell.GetSpellCooldown(spellId)
             if spellInfo and spellInfo.timeUntilEndOfStartRecovery and
                (spellInfo.isOnGCD == false or (spellInfo.isOnGCD == nil and not hasCharges)) then
+                -- The duration OBJECT is the only thing that can put a number on
+                -- screen while the cooldown is secret, so getting one matters more
+                -- than which API supplies it. Two reasons it used to come back
+                -- empty in combat: GetSpellCooldownDuration's second argument is
+                -- ignoreGCD and it DEFAULTS TO FALSE, so while a global cooldown
+                -- is running -- which in combat is most of the time -- it
+                -- describes the GCD rather than the spell's own cooldown, and a
+                -- GCD-length total is then rejected downstream; and an entry
+                -- cached while its charge data was secret has isChargeSpell false
+                -- even for a charge spell, sending it to the wrong API entirely.
+                -- Ask for the real cooldown, and fall back to the other API
+                -- rather than giving up.
                 local duration
                 if entry.isChargeSpell and C_Spell.GetSpellChargeDuration then
                     duration = C_Spell.GetSpellChargeDuration(spellId)
-                elseif not entry.isChargeSpell and C_Spell.GetSpellCooldownDuration then
-                    duration = C_Spell.GetSpellCooldownDuration(spellId)
+                elseif C_Spell.GetSpellCooldownDuration then
+                    duration = C_Spell.GetSpellCooldownDuration(spellId, true)
+                end
+                if not duration then
+                    if entry.isChargeSpell and C_Spell.GetSpellCooldownDuration then
+                        duration = C_Spell.GetSpellCooldownDuration(spellId, true)
+                    elseif C_Spell.GetSpellChargeDuration then
+                        duration = C_Spell.GetSpellChargeDuration(spellId)
+                    end
                 end
                 if ShowMovementSlot(count + 1, spellInfo, entry, duration) then
                     count = count + 1
                     nowShownReady[entry.spellId] = entry
-                    -- Charge spells alpha-hide while a charge is still banked.
-                    ApplyChargeVisibility(GetDisplaySlot(count), spellId, hasCharges)
+                    -- Charge spells alpha-hide while a charge is still banked;
+                    -- non-charge slots get the secret-lockout classification.
+                    ApplyChargeVisibility(GetDisplaySlot(count), spellId, hasCharges, entry, duration)
                 end
             end
         end
