@@ -1925,7 +1925,7 @@ local function GetOrCreateSlot(idx)
 
     local slotParent = CreateFrame("Frame", nil, EUI_Bags)
     slotParent:SetSize(SLOT_SIZE, SLOT_SIZE)
-    local btn = CreateFrame("ItemButton", nil, slotParent, "ContainerFrameItemButtonTemplate")
+    local btn = CreateFrame("ItemButton", "EUIBagSlot" .. idx, slotParent, "ContainerFrameItemButtonTemplate")
     btn:SetAllPoints(slotParent)
     btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     btn:RegisterForDrag("LeftButton")
@@ -2127,7 +2127,7 @@ local function GetOrCreateReagentSlot(idx)
 
     local slotParent = CreateFrame("Frame", nil, EUI_BagsReagent)
     slotParent:SetSize(SLOT_SIZE, SLOT_SIZE)
-    local btn = CreateFrame("ItemButton", nil, slotParent, "ContainerFrameItemButtonTemplate")
+    local btn = CreateFrame("ItemButton", "EUIReagentSlot" .. idx, slotParent, "ContainerFrameItemButtonTemplate")
     btn:SetAllPoints(slotParent)
     btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     btn:RegisterForDrag("LeftButton")
@@ -2533,10 +2533,12 @@ local function RenderButton(btn, data, _, col, row, startX, currentY, _, interac
         end
 
         -- Notify addon compatibility hooks that this button has been updated.
-        -- ContainerFrameItemButtonMixin:UpdateArrow() shows WoW's native upgrade
-        -- arrow and also serves as a hook point for addons like Pawn that attach
-        -- upgrade overlays to ContainerFrameItemButtonTemplate buttons.
-        if btn.UpdateArrow then
+        -- UpdateExtended() (from ItemButtonMixin) invokes UpdateArrow for WoW's
+        -- native upgrade indicator and fires the hook point that addons like Pawn
+        -- use to attach upgrade overlays to ContainerFrameItemButtonTemplate buttons.
+        if btn.UpdateExtended then
+            pcall(btn.UpdateExtended, btn)
+        elseif btn.UpdateArrow then
             pcall(btn.UpdateArrow, btn)
         end
     end
@@ -5091,6 +5093,100 @@ function EUI_Bags:RefreshInventory()
         end
     end
 
+    -- Sub-group index counter shared by all render paths that use set-gear sub-headers.
+    local setGearSubIdx = 0
+
+    -- Renders a flat block of items (fills columns, pads remainder row).
+    local function RenderItemBlock(blockItems)
+        local n = #blockItems
+        for j, data in ipairs(blockItems) do
+            slotIdx = slotIdx + 1
+            local btn = GetOrCreateSlot(slotIdx)
+            if btn then
+                btn:GetParent():SetParent(child)
+                local col = (j - 1) % columns
+                local row = math.floor((j - 1) / columns)
+                RenderButton(btn, data, slotIdx, col, row, startX, curY, columns)
+            end
+        end
+        local remainder = n % columns
+        local padCount
+        if n == 0 then
+            padCount = columns
+        elseif remainder == 0 then
+            padCount = 0
+        else
+            padCount = columns - remainder
+        end
+        if padCount > 0 then
+            RenderEmptyPad(n, padCount)
+        end
+        local totalInBlock = n + math.max(padCount, 0)
+        local blockRows = math.ceil(totalInBlock / columns)
+        curY = curY - (blockRows * (SLOT_SIZE + SPACING))
+    end
+
+    -- Renders set-gear items grouped by equipment set ID (plus an "Other" bucket
+    -- for items not matched to any named set).  Used by All Items, single-category,
+    -- and group render paths when selCat.isSetGear is true.
+    local function RenderSetGearSubGroups(setGearItems)
+        local setOrder = {}
+        local setItems = {}
+        local otherItems = {}
+        for _, data in ipairs(setGearItems) do
+            local sid = data._setGearSetID
+            if sid then
+                if not setItems[sid] then
+                    setItems[sid] = {}
+                    setOrder[#setOrder + 1] = sid
+                end
+                setItems[sid][#setItems[sid] + 1] = data
+            else
+                otherItems[#otherItems + 1] = data
+            end
+        end
+        if #otherItems > 0 then
+            setOrder[#setOrder + 1] = false
+        end
+        for _, sid in ipairs(setOrder) do
+            local subItems = sid and setItems[sid] or otherItems
+            if #subItems > 0 then
+                setGearSubIdx = setGearSubIdx + 1
+                local sh = GetOrCreateSetGearSubHeader(setGearSubIdx)
+                sh:SetParent(child)
+                sh:ClearAllPoints()
+                sh:SetPoint("TOPLEFT", child, "TOPLEFT", startX + 4, curY)
+                sh:SetWidth(gridW - 8)
+                if sid then
+                    local setName, setIcon = C_EquipmentSet.GetEquipmentSetInfo(sid)
+                    sh._label:SetText((setName or "?") .. " (" .. #subItems .. ")")
+                    -- Fallback: if the equipment set has no custom icon (returns 0),
+                    -- use the first item's icon so the sub-header always has an image.
+                    local iconToUse = (setIcon and setIcon ~= 0) and setIcon
+                        or (subItems[1] and subItems[1].info and subItems[1].info.iconFileID)
+                    if iconToUse and iconToUse ~= 0 then
+                        sh._icon:SetTexture(iconToUse)
+                        sh._icon:Show()
+                        sh._label:ClearAllPoints()
+                        sh._label:SetPoint("LEFT", sh._icon, "RIGHT", 3, 0)
+                    else
+                        sh._icon:Hide()
+                        sh._label:ClearAllPoints()
+                        sh._label:SetPoint("LEFT", sh, "LEFT", 0, 0)
+                    end
+                else
+                    sh._label:SetText("Other (" .. #subItems .. ")")
+                    sh._icon:Hide()
+                    sh._label:ClearAllPoints()
+                    sh._label:SetPoint("LEFT", sh, "LEFT", 0, 0)
+                end
+                sh:Show()
+                curY = curY - 18
+                RenderItemBlock(subItems)
+                curY = curY - 4
+            end
+        end
+    end
 
     if selectedCategoryIndex == -1 or selectedCategoryIndex == -2 then
         -- OneBag/MultiBag: Pinned Items (display-only) + bag section(s) + Reagent Bag. OneBag
@@ -5416,89 +5512,6 @@ function EUI_Bags:RefreshInventory()
         local renderedGroups = {}
         local headerIdx = 0
         local expSubIdx = 0
-        local setGearSubIdx = 0
-
-        local function RenderItemBlock(blockItems)
-            local n = #blockItems
-            for j, data in ipairs(blockItems) do
-                slotIdx = slotIdx + 1
-                local btn = GetOrCreateSlot(slotIdx)
-                if btn then  -- nil during combat (avoids minting tainted secure buttons)
-                    btn:GetParent():SetParent(child)
-                    local col = (j - 1) % columns
-                    local row = math.floor((j - 1) / columns)
-                    RenderButton(btn, data, slotIdx, col, row, startX, curY, columns)
-                end
-            end
-            local remainder = n % columns
-            local padCount
-            if n == 0 then
-                padCount = columns
-            elseif remainder == 0 then
-                padCount = 0
-            else
-                padCount = columns - remainder
-            end
-            -- Filler pads are cosmetic row-fillers (the "+" button is the only real slot); NEVER clamp to #emptySlots or they vanish when bags are full.
-            if padCount > 0 then
-                RenderEmptyPad(n, padCount)
-            end
-            local totalInBlock = n + math.max(padCount, 0)
-            local blockRows = math.ceil(totalInBlock / columns)
-            curY = curY - (blockRows * (SLOT_SIZE + SPACING))
-        end
-
-        -- Renders set-gear items grouped by equipment set ID (plus an "Other" bucket
-        -- for set-gear-category items that are not in any named set).  Used both by
-        -- the standalone "Item Set Gear" category path and the group render path.
-        local function RenderSetGearSubGroups(setGearItems)
-            local setOrder = {}
-            local setItems = {}
-            local otherItems = {}
-            for _, data in ipairs(setGearItems) do
-                local sid = data._setGearSetID
-                if sid then
-                    if not setItems[sid] then
-                        setItems[sid] = {}
-                        setOrder[#setOrder + 1] = sid
-                    end
-                    setItems[sid][#setItems[sid] + 1] = data
-                else
-                    otherItems[#otherItems + 1] = data
-                end
-            end
-            if #otherItems > 0 then
-                setOrder[#setOrder + 1] = false  -- sentinel for "Other" bucket
-            end
-            for _, sid in ipairs(setOrder) do
-                local subItems = sid and setItems[sid] or otherItems
-                if #subItems > 0 then
-                    setGearSubIdx = setGearSubIdx + 1
-                    local sh = GetOrCreateSetGearSubHeader(setGearSubIdx)
-                    sh:SetParent(child)
-                    sh:ClearAllPoints()
-                    sh:SetPoint("TOPLEFT", child, "TOPLEFT", startX + 4, curY)
-                    sh:SetWidth(gridW - 8)
-                    if sid then
-                        local setName, setIcon = C_EquipmentSet.GetEquipmentSetInfo(sid)
-                        sh._label:SetText((setName or "?") .. " (" .. #subItems .. ")")
-                        if setIcon and setIcon ~= 0 then
-                            sh._icon:SetTexture(setIcon)
-                            sh._icon:Show()
-                        else
-                            sh._icon:Hide()
-                        end
-                    else
-                        sh._label:SetText("Other (" .. #subItems .. ")")
-                        sh._icon:Hide()
-                    end
-                    sh:Show()
-                    curY = curY - 18
-                    RenderItemBlock(subItems)
-                    curY = curY - 4
-                end
-            end
-        end
 
         local function RenderSection(sectionName, sectionItems, isUserCreated, showPinAdd, alwaysShow, assignCatIdx, nestByExpansion)
             local itemCount = #sectionItems
@@ -5850,6 +5863,11 @@ function EUI_Bags:RefreshInventory()
                 hdr:Show()
                 curY = curY - 22
 
+                if memberCat and memberCat.isSetGear and #memberItems > 0 then
+                    -- Equipment set gear member: sub-group by set (icons + names)
+                    RenderSetGearSubGroups(memberItems)
+                    curY = curY - 6
+                else
                 for j, data in ipairs(memberItems) do
                     slotIdx = slotIdx + 1
                     local btn = GetOrCreateSlot(slotIdx)
@@ -5895,6 +5913,7 @@ function EUI_Bags:RefreshInventory()
                 local totalInSection = memberItemCount + math.max(padCount, 0)
                 local sectionRows = math.ceil(totalInSection / columns)
                 curY = curY - (sectionRows * (SLOT_SIZE + SPACING)) - 6
+                end -- isSetGear else
 
                 end -- hideEmpty guard
             end
@@ -6028,34 +6047,39 @@ function EUI_Bags:RefreshInventory()
             end
 
             local itemCount = #displayItems
-            for i, data in ipairs(displayItems) do
-                slotIdx = slotIdx + 1
-                local btn = GetOrCreateSlot(slotIdx)
-                if btn then
-                    btn:GetParent():SetParent(child)
-                    local col = (i - 1) % columns
-                    local row = math.floor((i - 1) / columns)
-                    RenderButton(btn, data, slotIdx, col, row, startX, curY, columns)
-                end
-            end
-
-            local remainder = itemCount % columns
-            local padCount
-            if itemCount == 0 then
-                padCount = columns
-            elseif remainder == 0 then
-                padCount = 0
+            if selCat and selCat.isSetGear and itemCount > 0 then
+                -- Equipment set category: split into per-set sub-groups with icons
+                RenderSetGearSubGroups(displayItems)
             else
-                padCount = columns - remainder
-            end
-            -- Cosmetic filler pads -- never clamp to free bag slots (see above).
-            if padCount > 0 then
-                RenderEmptyPad(itemCount, padCount)
-            end
+                for i, data in ipairs(displayItems) do
+                    slotIdx = slotIdx + 1
+                    local btn = GetOrCreateSlot(slotIdx)
+                    if btn then
+                        btn:GetParent():SetParent(child)
+                        local col = (i - 1) % columns
+                        local row = math.floor((i - 1) / columns)
+                        RenderButton(btn, data, slotIdx, col, row, startX, curY, columns)
+                    end
+                end
 
-            local totalItems = itemCount + math.max(padCount, 0)
-            local gridRows = math.ceil(totalItems / columns)
-            curY = curY - (gridRows * (SLOT_SIZE + SPACING))
+                local remainder = itemCount % columns
+                local padCount
+                if itemCount == 0 then
+                    padCount = columns
+                elseif remainder == 0 then
+                    padCount = 0
+                else
+                    padCount = columns - remainder
+                end
+                -- Cosmetic filler pads -- never clamp to free bag slots (see above).
+                if padCount > 0 then
+                    RenderEmptyPad(itemCount, padCount)
+                end
+
+                local totalItems = itemCount + math.max(padCount, 0)
+                local gridRows = math.ceil(totalItems / columns)
+                curY = curY - (gridRows * (SLOT_SIZE + SPACING))
+            end
         end
     end
 
