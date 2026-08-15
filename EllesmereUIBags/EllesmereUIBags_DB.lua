@@ -44,6 +44,8 @@ local BAGS_DEFAULTS = {
         bagDesaturateJunkItems = false,
         bagDisplayBindType    = false,
         bagBindTypeFontSize   = 11,
+        -- Search / filter settings
+        bagSearchDebounce     = 100,     -- milliseconds to wait before applying search query
     },
 }
 local db = EllesmereUI.Lite.NewDB("EllesmereUIBagsDB", BAGS_DEFAULTS)

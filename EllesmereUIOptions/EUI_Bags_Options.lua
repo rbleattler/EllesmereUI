@@ -758,6 +758,23 @@ initFrame:SetScript("OnEvent", function(self)
                 { type="label", text="" }
             ); y = y - h
 
+            ---------------------------------------------------------------------------
+            --  SEARCH
+            ---------------------------------------------------------------------------
+            _, h = W:SectionHeader(parent, "SEARCH", y); y = y - h
+
+            -- Search debounce delay
+            _, h = W:DualRow(parent, y,
+                { type="slider", text="Search Debounce (ms)",
+                  min=0, max=500, step=25,
+                  tooltip="How long to wait (in milliseconds) after you stop typing before filtering is applied. Lower = more responsive; higher = fewer refreshes while typing rapidly. Default: 100ms.",
+                  getValue=function() return db.profile.bagSearchDebounce or 100 end,
+                  setValue=function(v)
+                      db.profile.bagSearchDebounce = v
+                  end },
+                { type="label", text="" }
+            ); y = y - h
+
             _, h = W:Spacer(parent, y, 20); y = y - h
             return math.abs(y)
             end) -- end pcall

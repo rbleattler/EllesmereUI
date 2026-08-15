@@ -1219,19 +1219,37 @@ local function CreateHeader()
     clear.tex:SetPoint("CENTER", 0, 1)
     clear.tex:SetTextColor(0.8, 0.8, 0.8)
     clear:Hide()
-    clear:SetScript("OnClick", function() search:SetText(""); search:ClearFocus(); C_Container.SetItemSearch("") end)
+    -- Debounce timer: cancellable reference so rapid keystrokes collapse into one refresh
+    local _searchDebounceTimer = nil
+
+    -- CommitSearch: apply a query immediately, cancelling any pending debounce.
+    -- Used by clear-button and ESC so those feel instant.
+    local function CommitSearch(text)
+        if _searchDebounceTimer then _searchDebounceTimer:Cancel(); _searchDebounceTimer = nil end
+        if EUI_FilterEngine then EUI_FilterEngine:SetQuery(text) end
+        C_Container.SetItemSearch(text)
+        if EUI_Bags:IsVisible() then EUI_Bags:RefreshInventory() end
+    end
+
+    clear:SetScript("OnClick", function() search:SetText(""); search:ClearFocus(); CommitSearch("") end)
 
     search:SetScript("OnEscapePressed", function(self)
         self:SetText("")
         self:ClearFocus()
-        C_Container.SetItemSearch("")
+        CommitSearch("")
     end)
     search:SetScript("OnTextChanged", function(self)
         local text = self:GetText()
         placeholder:SetShown(text == "")
         clear:SetShown(text ~= "")
-        C_Container.SetItemSearch(text)
-        if EUI_Bags:IsVisible() then EUI_Bags:RefreshInventory() end
+        -- Debounce: collapse rapid keystrokes into one refresh after a short delay
+        if _searchDebounceTimer then _searchDebounceTimer:Cancel(); _searchDebounceTimer = nil end
+        local delayMs = BP().bagSearchDebounce
+        if type(delayMs) ~= "number" or delayMs <= 0 then delayMs = 100 end
+        _searchDebounceTimer = C_Timer.NewTimer(delayMs / 1000, function()
+            _searchDebounceTimer = nil
+            CommitSearch(text)
+        end)
     end)
 
     local close = CreateFrame("Button", nil, header)
@@ -1907,7 +1925,7 @@ local function GetOrCreateSlot(idx)
 
     local slotParent = CreateFrame("Frame", nil, EUI_Bags)
     slotParent:SetSize(SLOT_SIZE, SLOT_SIZE)
-    local btn = CreateFrame("ItemButton", nil, slotParent, "ContainerFrameItemButtonTemplate")
+    local btn = CreateFrame("ItemButton", "EUIBagSlot" .. idx, slotParent, "ContainerFrameItemButtonTemplate")
     btn:SetAllPoints(slotParent)
     btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     btn:RegisterForDrag("LeftButton")
@@ -2109,7 +2127,7 @@ local function GetOrCreateReagentSlot(idx)
 
     local slotParent = CreateFrame("Frame", nil, EUI_BagsReagent)
     slotParent:SetSize(SLOT_SIZE, SLOT_SIZE)
-    local btn = CreateFrame("ItemButton", nil, slotParent, "ContainerFrameItemButtonTemplate")
+    local btn = CreateFrame("ItemButton", "EUIReagentSlot" .. idx, slotParent, "ContainerFrameItemButtonTemplate")
     btn:SetAllPoints(slotParent)
     btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     btn:RegisterForDrag("LeftButton")
@@ -2291,6 +2309,7 @@ local function RenderButton(btn, data, _, col, row, startX, currentY, _, interac
     btn:Show()
 
     btn:SetID(data.slot or 0)
+    btn.bag = data.bag or 0   -- ContainerFrameItemButtonMixin:GetBagID() reads self.bag
     parent:SetID(data.bag or 0)
 
     -- Always clear overlays upfront (pooled buttons carry stale state from prior items)
@@ -2348,7 +2367,7 @@ local function RenderButton(btn, data, _, col, row, startX, currentY, _, interac
         local isJunk = BP().bagDesaturateJunkItems and quality == 0
         SetItemButtonDesaturated(btn, data.info.isLocked or isJunk)
 
-        local filtered = data.info.isFiltered
+        local filtered = not (EUI_FilterEngine and EUI_FilterEngine:IsActive()) and data.info.isFiltered
         btn:SetAlpha(filtered and 0.2 or 1)
         if btn._textOverlay then btn._textOverlay:SetAlpha(filtered and 0.2 or 1) end
 
@@ -2513,6 +2532,15 @@ local function RenderButton(btn, data, _, col, row, startX, currentY, _, interac
             end
         end
 
+        -- Notify addon compatibility hooks that this button has been updated.
+        -- UpdateExtended() (from ItemButtonMixin) invokes UpdateArrow for WoW's
+        -- native upgrade indicator and fires the hook point that addons like Pawn
+        -- use to attach upgrade overlays to ContainerFrameItemButtonTemplate buttons.
+        if btn.UpdateExtended then
+            pcall(btn.UpdateExtended, btn)
+        elseif btn.UpdateArrow then
+            pcall(btn.UpdateArrow, btn)
+        end
     end
 end
 
@@ -4519,6 +4547,26 @@ local function GetOrCreateExpSubHeader(idx)
     return f
 end
 
+-- Sub-headers for equipment set gear grouping (icon + set name)
+local _setGearSubHeaders = {}
+
+local function GetOrCreateSetGearSubHeader(idx)
+    if _setGearSubHeaders[idx] then return _setGearSubHeaders[idx] end
+    local f = CreateFrame("Frame", nil, EUI_Bags)
+    f:SetHeight(18)
+    f._icon = f:CreateTexture(nil, "ARTWORK")
+    f._icon:SetSize(14, 14)
+    f._icon:SetPoint("LEFT", f, "LEFT", 0, 0)
+    f._icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    f._label = f:CreateFontString(nil, "OVERLAY")
+    SetBagFont(f._label, 9)
+    f._label:SetPoint("LEFT", f._icon, "RIGHT", 3, 0)
+    f._label:SetTextColor(0.65, 0.65, 0.65)
+    f._label:SetJustifyH("LEFT")
+    _setGearSubHeaders[idx] = f
+    return f
+end
+
 -------------------------------------------------------------------------------
 --  Scroll Frame + Scrollbar for item grid
 -------------------------------------------------------------------------------
@@ -4728,13 +4776,15 @@ function EUI_Bags:RefreshInventory()
                             d._giTrackColor = trackColor
                         end
                     end
-                    -- Warbound check (warbank dim overlay) + WuE bind check (gear only, when bind-type text is enabled).
+                    -- Warbound check (warbank dim overlay) + WuE bind check (gear only).
+                    -- Always check _isWuE for gear so search keywords work regardless of
+                    -- whether the BoE display option is enabled.
                     local loc = ItemLocation:CreateFromBagAndSlot(bag, slot)
                     if loc and C_Item.DoesItemExist(loc) then
                         if C_Bank and C_Bank.IsItemAllowedInBankType then
                             d._isWarbound = C_Bank.IsItemAllowedInBankType(Enum.BankType.Account, loc)
                         end
-                        if isGear and not info.isBound and BP().bagDisplayBindType then
+                        if isGear and not info.isBound and C_Item.IsBoundToAccountUntilEquip then
                             d._isWuE = C_Item.IsBoundToAccountUntilEquip(loc)
                         end
                     end
@@ -4860,7 +4910,15 @@ function EUI_Bags:RefreshInventory()
         elseif filterSet then
             show = data.categoryIndex and filterSet[data.categoryIndex]
         end
-        if show and data.info and data.info.isFiltered then show = false end
+        if show then
+            -- Use FilterEngine (lua-level matching + token support) when a query is
+            -- active; fall back to Blizzard's isFiltered flag when no query is set.
+            if EUI_FilterEngine and EUI_FilterEngine:IsActive() then
+                show = EUI_FilterEngine:Matches(data)
+            elseif data.info and data.info.isFiltered then
+                show = false
+            end
+        end
         if show then displayItems[#displayItems + 1] = data end
     end
 
@@ -4918,6 +4976,9 @@ function EUI_Bags:RefreshInventory()
         SetBagFont(hdr._hint, catTitleSize - 1)
     end
     for _, sh in pairs(_expSubHeaders) do
+        sh:Hide()
+    end
+    for _, sh in pairs(_setGearSubHeaders) do
         sh:Hide()
     end
     if EUI_Bags._pinOverlayBtn then EUI_Bags._pinOverlayBtn:Hide() end
@@ -5032,6 +5093,100 @@ function EUI_Bags:RefreshInventory()
         end
     end
 
+    -- Sub-group index counter shared by all render paths that use set-gear sub-headers.
+    local setGearSubIdx = 0
+
+    -- Renders a flat block of items (fills columns, pads remainder row).
+    local function RenderItemBlock(blockItems)
+        local n = #blockItems
+        for j, data in ipairs(blockItems) do
+            slotIdx = slotIdx + 1
+            local btn = GetOrCreateSlot(slotIdx)
+            if btn then
+                btn:GetParent():SetParent(child)
+                local col = (j - 1) % columns
+                local row = math.floor((j - 1) / columns)
+                RenderButton(btn, data, slotIdx, col, row, startX, curY, columns)
+            end
+        end
+        local remainder = n % columns
+        local padCount
+        if n == 0 then
+            padCount = columns
+        elseif remainder == 0 then
+            padCount = 0
+        else
+            padCount = columns - remainder
+        end
+        if padCount > 0 then
+            RenderEmptyPad(n, padCount)
+        end
+        local totalInBlock = n + math.max(padCount, 0)
+        local blockRows = math.ceil(totalInBlock / columns)
+        curY = curY - (blockRows * (SLOT_SIZE + SPACING))
+    end
+
+    -- Renders set-gear items grouped by equipment set ID (plus an "Other" bucket
+    -- for items not matched to any named set).  Used by All Items, single-category,
+    -- and group render paths when selCat.isSetGear is true.
+    local function RenderSetGearSubGroups(setGearItems)
+        local setOrder = {}
+        local setItems = {}
+        local otherItems = {}
+        for _, data in ipairs(setGearItems) do
+            local sid = data._setGearSetID
+            if sid then
+                if not setItems[sid] then
+                    setItems[sid] = {}
+                    setOrder[#setOrder + 1] = sid
+                end
+                setItems[sid][#setItems[sid] + 1] = data
+            else
+                otherItems[#otherItems + 1] = data
+            end
+        end
+        if #otherItems > 0 then
+            setOrder[#setOrder + 1] = false
+        end
+        for _, sid in ipairs(setOrder) do
+            local subItems = sid and setItems[sid] or otherItems
+            if #subItems > 0 then
+                setGearSubIdx = setGearSubIdx + 1
+                local sh = GetOrCreateSetGearSubHeader(setGearSubIdx)
+                sh:SetParent(child)
+                sh:ClearAllPoints()
+                sh:SetPoint("TOPLEFT", child, "TOPLEFT", startX + 4, curY)
+                sh:SetWidth(gridW - 8)
+                if sid then
+                    local setName, setIcon = C_EquipmentSet.GetEquipmentSetInfo(sid)
+                    sh._label:SetText((setName or "?") .. " (" .. #subItems .. ")")
+                    -- Fallback: if the equipment set has no custom icon (returns 0),
+                    -- use the first item's icon so the sub-header always has an image.
+                    local iconToUse = (setIcon and setIcon ~= 0) and setIcon
+                        or (subItems[1] and subItems[1].info and subItems[1].info.iconFileID)
+                    if iconToUse and iconToUse ~= 0 then
+                        sh._icon:SetTexture(iconToUse)
+                        sh._icon:Show()
+                        sh._label:ClearAllPoints()
+                        sh._label:SetPoint("LEFT", sh._icon, "RIGHT", 3, 0)
+                    else
+                        sh._icon:Hide()
+                        sh._label:ClearAllPoints()
+                        sh._label:SetPoint("LEFT", sh, "LEFT", 0, 0)
+                    end
+                else
+                    sh._label:SetText("Other (" .. #subItems .. ")")
+                    sh._icon:Hide()
+                    sh._label:ClearAllPoints()
+                    sh._label:SetPoint("LEFT", sh, "LEFT", 0, 0)
+                end
+                sh:Show()
+                curY = curY - 18
+                RenderItemBlock(subItems)
+                curY = curY - 4
+            end
+        end
+    end
 
     if selectedCategoryIndex == -1 or selectedCategoryIndex == -2 then
         -- OneBag/MultiBag: Pinned Items (display-only) + bag section(s) + Reagent Bag. OneBag
@@ -5358,36 +5513,6 @@ function EUI_Bags:RefreshInventory()
         local headerIdx = 0
         local expSubIdx = 0
 
-        local function RenderItemBlock(blockItems)
-            local n = #blockItems
-            for j, data in ipairs(blockItems) do
-                slotIdx = slotIdx + 1
-                local btn = GetOrCreateSlot(slotIdx)
-                if btn then  -- nil during combat (avoids minting tainted secure buttons)
-                    btn:GetParent():SetParent(child)
-                    local col = (j - 1) % columns
-                    local row = math.floor((j - 1) / columns)
-                    RenderButton(btn, data, slotIdx, col, row, startX, curY, columns)
-                end
-            end
-            local remainder = n % columns
-            local padCount
-            if n == 0 then
-                padCount = columns
-            elseif remainder == 0 then
-                padCount = 0
-            else
-                padCount = columns - remainder
-            end
-            -- Filler pads are cosmetic row-fillers (the "+" button is the only real slot); NEVER clamp to #emptySlots or they vanish when bags are full.
-            if padCount > 0 then
-                RenderEmptyPad(n, padCount)
-            end
-            local totalInBlock = n + math.max(padCount, 0)
-            local blockRows = math.ceil(totalInBlock / columns)
-            curY = curY - (blockRows * (SLOT_SIZE + SPACING))
-        end
-
         local function RenderSection(sectionName, sectionItems, isUserCreated, showPinAdd, alwaysShow, assignCatIdx, nestByExpansion)
             local itemCount = #sectionItems
             if itemCount == 0 and not isUserCreated and not showPinAdd and not alwaysShow then return end
@@ -5618,25 +5743,85 @@ function EUI_Bags:RefreshInventory()
                     renderedGroups[cat.groupName] = true
                     if not hiddenSet[cat.groupName] then
                         local members = EUI_CategoryManager:GetGroupMembers(cat.groupName)
-                        local merged = {}
+
+                        -- Detect a set-gear member so we can sub-group by equipment set
+                        local setGearMemberIdx = nil
                         for _, mi in ipairs(members) do
-                            if itemsByCat[mi] then
-                                for _, data in ipairs(itemsByCat[mi]) do
-                                    merged[#merged + 1] = data
-                                end
+                            if cats[mi] and cats[mi].isSetGear then
+                                setGearMemberIdx = mi
+                                break
                             end
                         end
-                        if #merged > 0 then
-                            ApplySavedOrder(cat.groupName, merged)
+
+                        if setGearMemberIdx then
+                            -- Group has a set-gear member: render set-gear sub-groups then
+                            -- any remaining member items flat in the same group header.
+                            local setGearItems = itemsByCat[setGearMemberIdx] or {}
+                            local otherMerged = {}
+                            for _, mi in ipairs(members) do
+                                if mi ~= setGearMemberIdx and itemsByCat[mi] then
+                                    for _, data in ipairs(itemsByCat[mi]) do
+                                        otherMerged[#otherMerged + 1] = data
+                                    end
+                                end
+                            end
+                            local totalCount = #setGearItems + #otherMerged
+                            if totalCount > 0 then
+                                headerIdx = headerIdx + 1
+                                local hdr = GetOrCreateCatHeader(headerIdx)
+                                hdr:SetParent(child)
+                                hdr:ClearAllPoints()
+                                hdr:SetPoint("TOPLEFT", child, "TOPLEFT", startX, curY)
+                                hdr:SetWidth(gridW)
+                                hdr._label:SetText(cat.groupName .. " (" .. totalCount .. ")")
+                                hdr._hint:SetText("")
+                                hdr:Show()
+                                curY = curY - 22
+                                if #setGearItems > 0 then
+                                    RenderSetGearSubGroups(setGearItems)
+                                end
+                                if #otherMerged > 0 then
+                                    RenderItemBlock(otherMerged)
+                                end
+                                curY = curY - 2
+                            end
+                        else
+                            local merged = {}
+                            for _, mi in ipairs(members) do
+                                if itemsByCat[mi] then
+                                    for _, data in ipairs(itemsByCat[mi]) do
+                                        merged[#merged + 1] = data
+                                    end
+                                end
+                            end
+                            if #merged > 0 then
+                                ApplySavedOrder(cat.groupName, merged)
+                            end
+                            RenderSection(cat.groupName, merged, false, nil, nil, members[1], true)
                         end
-                        RenderSection(cat.groupName, merged, false, nil, nil, members[1], true)
                     end
                 end
             else
                 if not hiddenSet[cat._defaultName] then
                     local catItems = itemsByCat[ci] or {}
                     local isUserCreated = cat.isUserCreated
-                    RenderSection(cat.name, catItems, isUserCreated, cat.isPinned, cat.isRecent, ci, true)
+                    if cat.isSetGear and #catItems > 0 then
+                        -- Equipment set gear: render main header then sub-group by set
+                        headerIdx = headerIdx + 1
+                        local hdr = GetOrCreateCatHeader(headerIdx)
+                        hdr:SetParent(child)
+                        hdr:ClearAllPoints()
+                        hdr:SetPoint("TOPLEFT", child, "TOPLEFT", startX, curY)
+                        hdr:SetWidth(gridW)
+                        hdr._label:SetText(cat.name .. " (" .. #catItems .. ")")
+                        hdr._hint:SetText("")
+                        hdr:Show()
+                        curY = curY - 22
+                        RenderSetGearSubGroups(catItems)
+                        curY = curY - 2
+                    else
+                        RenderSection(cat.name, catItems, isUserCreated, cat.isPinned, cat.isRecent, ci, true)
+                    end
                 end
             end
         end
@@ -5678,6 +5863,11 @@ function EUI_Bags:RefreshInventory()
                 hdr:Show()
                 curY = curY - 22
 
+                if memberCat and memberCat.isSetGear and #memberItems > 0 then
+                    -- Equipment set gear member: sub-group by set (icons + names)
+                    RenderSetGearSubGroups(memberItems)
+                    curY = curY - 6
+                else
                 for j, data in ipairs(memberItems) do
                     slotIdx = slotIdx + 1
                     local btn = GetOrCreateSlot(slotIdx)
@@ -5723,6 +5913,7 @@ function EUI_Bags:RefreshInventory()
                 local totalInSection = memberItemCount + math.max(padCount, 0)
                 local sectionRows = math.ceil(totalInSection / columns)
                 curY = curY - (sectionRows * (SLOT_SIZE + SPACING)) - 6
+                end -- isSetGear else
 
                 end -- hideEmpty guard
             end
@@ -5856,34 +6047,39 @@ function EUI_Bags:RefreshInventory()
             end
 
             local itemCount = #displayItems
-            for i, data in ipairs(displayItems) do
-                slotIdx = slotIdx + 1
-                local btn = GetOrCreateSlot(slotIdx)
-                if btn then
-                    btn:GetParent():SetParent(child)
-                    local col = (i - 1) % columns
-                    local row = math.floor((i - 1) / columns)
-                    RenderButton(btn, data, slotIdx, col, row, startX, curY, columns)
-                end
-            end
-
-            local remainder = itemCount % columns
-            local padCount
-            if itemCount == 0 then
-                padCount = columns
-            elseif remainder == 0 then
-                padCount = 0
+            if selCat and selCat.isSetGear and itemCount > 0 then
+                -- Equipment set category: split into per-set sub-groups with icons
+                RenderSetGearSubGroups(displayItems)
             else
-                padCount = columns - remainder
-            end
-            -- Cosmetic filler pads -- never clamp to free bag slots (see above).
-            if padCount > 0 then
-                RenderEmptyPad(itemCount, padCount)
-            end
+                for i, data in ipairs(displayItems) do
+                    slotIdx = slotIdx + 1
+                    local btn = GetOrCreateSlot(slotIdx)
+                    if btn then
+                        btn:GetParent():SetParent(child)
+                        local col = (i - 1) % columns
+                        local row = math.floor((i - 1) / columns)
+                        RenderButton(btn, data, slotIdx, col, row, startX, curY, columns)
+                    end
+                end
 
-            local totalItems = itemCount + math.max(padCount, 0)
-            local gridRows = math.ceil(totalItems / columns)
-            curY = curY - (gridRows * (SLOT_SIZE + SPACING))
+                local remainder = itemCount % columns
+                local padCount
+                if itemCount == 0 then
+                    padCount = columns
+                elseif remainder == 0 then
+                    padCount = 0
+                else
+                    padCount = columns - remainder
+                end
+                -- Cosmetic filler pads -- never clamp to free bag slots (see above).
+                if padCount > 0 then
+                    RenderEmptyPad(itemCount, padCount)
+                end
+
+                local totalItems = itemCount + math.max(padCount, 0)
+                local gridRows = math.ceil(totalItems / columns)
+                curY = curY - (gridRows * (SLOT_SIZE + SPACING))
+            end
         end
     end
 
@@ -5893,6 +6089,37 @@ function EUI_Bags:RefreshInventory()
         if btn then btn:GetParent():Hide() end
     end
 
+    -- Empty state: when a filter is active but no items matched, show a label
+    -- instead of an empty grid.  Only for category/All Items views; OneBag and
+    -- MultiBag keep dimmed slots visible, so no label is needed there.
+    if child then
+        if not EUI_Bags._emptyStateLabel then
+            local el = child:CreateFontString(nil, "OVERLAY")
+            SetBagFont(el, 12)
+            el:SetTextColor(0.5, 0.5, 0.5)
+            el:SetJustifyH("CENTER")
+            EUI_Bags._emptyStateLabel = el
+        end
+        do
+            local el = EUI_Bags._emptyStateLabel
+            local noResults = EUI_FilterEngine and EUI_FilterEngine:IsActive()
+                and selectedCategoryIndex ~= -1
+                and selectedCategoryIndex ~= -2
+                and #displayItems == 0
+            if noResults then
+                el:SetParent(child)
+                el:ClearAllPoints()
+                el:SetPoint("TOP", child, "TOP", 0, -40)
+                el:SetWidth(gridW)
+                el:SetText(EllesmereUI.L("No items found"))
+                el:Show()
+            else
+                el:Hide()
+            end
+        end
+    end
+
+    -- Set scroll child height to content height
     local contentH = math.abs(curY) + 10
     if child then child:SetHeight(contentH) end
 
@@ -6005,7 +6232,7 @@ function EUI_BagsReagent:RefreshInventory()
             btn:SetItemButtonTexture(data.info.iconFileID)
             btn:SetItemButtonCount(data.info.stackCount)
             SetItemButtonDesaturated(btn, data.info.isLocked)
-            local filtered = data.info.isFiltered
+            local filtered = not (EUI_FilterEngine and EUI_FilterEngine:IsActive()) and data.info.isFiltered
             btn:SetAlpha(filtered and 0.2 or 1)
             if btn._textOverlay then btn._textOverlay:SetAlpha(filtered and 0.2 or 1) end
 
